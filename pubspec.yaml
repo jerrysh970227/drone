@@ -1,0 +1,27 @@
+name: drone_app
+description: "A new Flutter project."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.7.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  web_socket_channel: ^3.0.3
+  webview_flutter: ^4.8.0
+  flutter_joystick: ^0.2.2
+  logging: ^1.2.0
+  image: ^4.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+#  assets:
+#    - assets/mjpeg.html
