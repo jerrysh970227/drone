@@ -1,4 +1,4 @@
-name: drone_app
+name: drone
 description: "A new Flutter project."
 publish_to: 'none'
 version: 1.0.0+1
@@ -14,8 +14,14 @@ dependencies:
   webview_flutter: ^4.8.0
   flutter_joystick: ^0.2.2
   logging: ^1.2.0
-  image: ^4.2.0
-  lottie: ^2.7.0
+  image: ^4.5.4
+  lottie: ^3.3.1
+  flutter_launcher_icons: ^0.14.3
+
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/image/drone.jpg"
 
 dev_dependencies:
   flutter_test:
@@ -26,5 +32,5 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/image/drone.png
+    - assets/image/drone.jpg
     - assets/lottie/droneFly.json

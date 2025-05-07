@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_joystick/flutter_joystick.dart';
 import 'package:logging/logging.dart';
 import 'drone_controller.dart';
@@ -37,6 +38,12 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
   @override
   void initState() {
     super.initState();
+
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+
     _controller = DroneController(
       onStatusChanged: (status, connected) {
         setState(() {
@@ -211,6 +218,9 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
     _controller.dispose();
     _disconnectFromStream();
     super.dispose();
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+    ]);
   }
 
   void _updateControlValues(JoystickMode mode, double x, double y) {

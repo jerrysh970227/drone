@@ -57,11 +57,11 @@ class _HomeState extends State<Home> {
                         softWrap: false,
                       ),
                     ),
-                    SizedBox(width: 10),
+                    SizedBox(width: 5),
                     Lottie.asset(
                       "assets/lottie/droneFly.json",
-                      width: 200,
-                      height: 200,
+                      width: 150,
+                      height: 300,
                       repeat: true,
                     ),
                   ],
@@ -70,37 +70,60 @@ class _HomeState extends State<Home> {
               ),
               SizedBox(height: 8),
               Expanded(
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    TextButton(
-                      onPressed: () {},
-                      child: Text(
-                        "我的裝置",
-                        style: TextStyle(
-                          color: Colors.black,
-                          fontSize: 20,
+                child: DefaultTabController(
+                  length: 2,
+                  child: Column(
+                    children: [
+                      TabBar(
+                        labelColor: Colors.white,
+                        // 選中的文字顏色
+                        unselectedLabelColor: Colors.black,
+                        // 沒選中的顏色
+                        indicator: BoxDecoration(
+                          color: Colors.black, // 背景顏色
+                          borderRadius: BorderRadius.circular(30), // 圓角半徑
+                        ),
+                        indicatorSize: TabBarIndicatorSize.tab,
+                        labelStyle: TextStyle(
+                          fontSize: 16,
                           fontWeight: FontWeight.bold,
                         ),
+                        tabs: [Tab(text: "我的裝置"), Tab(text: "未知裝置")],
                       ),
-                    ),
-                    SizedBox(width: 30),
-                    TextButton(
-                      onPressed: () {},
-                      child: Text(
-                        "未知裝置",
-                        style: TextStyle(
-                          color: Colors.black,
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
+                      Expanded(
+                        child: TabBarView(
+                          children: [
+                            // Tab 1：我的裝置
+                            GridView.builder(
+                              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: 2, // 每行 2 個卡片
+                                crossAxisSpacing: 8.0, // 水平間距
+                                mainAxisSpacing: 8.0, // 垂直間距
+                              ),
+                              itemCount: 1, // 顯示 10 格
+                              itemBuilder: (context, index) {
+                                return Card(
+                                  color: Colors.grey[400],
+                                  child: ListTile(
+                                    leading: Icon(Icons.camera, color: Colors.white),
+                                    title: Text("裝置 ${index + 1}", style: TextStyle(color: Colors.white)),
+                                    onTap: (){
+                                      Navigator.push(context, MaterialPageRoute(builder: (context) => DroneJoystickPage()));
+                                    },
+                                  ),
+                                );
+                              },
+                            ),
+                            // Tab 2：未知裝置
+                            Center(child: Text("還沒連線")),
+                          ],
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-                flex: 1,
+                flex: 7,
               ),
-              Expanded(child: Card(), flex: 6),
             ],
           ),
         ),
