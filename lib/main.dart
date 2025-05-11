@@ -34,6 +34,12 @@ class _HomeState extends State<Home> {
   final bool isSelect = false;
 
   @override
+  void initState() {
+    super.initState();
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.white,
@@ -48,7 +54,7 @@ class _HomeState extends State<Home> {
                     Expanded(
                       child: Text(
                         "Welcome to Our DIY Drone App! ",
-                        maxLines: 3,
+                        maxLines: 5,
                         style: TextStyle(
                           fontSize: 25,
                           fontWeight: FontWeight.bold,
@@ -95,27 +101,47 @@ class _HomeState extends State<Home> {
                           children: [
                             // Tab 1：我的裝置
                             GridView.builder(
-                              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: 2, // 每行 2 個卡片
-                                crossAxisSpacing: 8.0, // 水平間距
-                                mainAxisSpacing: 8.0, // 垂直間距
-                              ),
+                              gridDelegate:
+                                  SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: 2, // 每行 2 個卡片
+                                    crossAxisSpacing: 8.0, // 水平間距
+                                    mainAxisSpacing: 8.0, // 垂直間距
+                                  ),
                               itemCount: 1, // 顯示 10 格
                               itemBuilder: (context, index) {
                                 return Card(
-                                  color: Colors.grey[400],
+                                  shadowColor: Colors.black,
+                                  elevation: 10,
+                                  color: Colors.white,
                                   child: ListTile(
-                                    leading: Icon(Icons.camera, color: Colors.white),
-                                    title: Text("裝置 ${index + 1}", style: TextStyle(color: Colors.white)),
-                                    onTap: (){
-                                      Navigator.push(context, MaterialPageRoute(builder: (context) => DroneJoystickPage()));
+                                    leading: Icon(
+                                      Icons.airplanemode_active,
+                                      color: Colors.black,
+                                    ),
+                                    title: Text(
+                                      "風暴毀滅者",
+                                      style: TextStyle(color: Colors.black),
+                                    ),
+                                    onTap: () {
+                                      Navigator.push(
+                                        context,
+                                        MaterialPageRoute(
+                                          builder:
+                                              (context) => DroneJoystickPage(),
+                                        ),
+                                      );
                                     },
                                   ),
                                 );
                               },
                             ),
                             // Tab 2：未知裝置
-                            Center(child: Text("還沒連線")),
+                            Center(
+                              child: Text(
+                                "查無裝置，請插入USB並開啟藍芽搜尋",
+                                style: TextStyle(color: Colors.black),
+                              ),
+                            ),
                           ],
                         ),
                       ),
