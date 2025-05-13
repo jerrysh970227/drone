@@ -35,6 +35,8 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
   Uint8List? _currentFrame;
   int _retries = 0;
   final int maxRetries = 5;
+  bool isRecording = false;
+  bool modeChanged = false;
 
   @override
   void initState() {
@@ -211,6 +213,28 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
     }
   }
 
+  void startRecording() async {
+    final Socket socket = await Socket.connect(AppConfig.droneIP, 12345);
+    socket.write('start_recording');
+    socket.listen((data) {
+      print(String.fromCharCodes(data));
+    });
+    setState(() {
+      isRecording = true;
+    });
+  }
+
+  void stopRecording() async {
+    final Socket socket = await Socket.connect(AppConfig.droneIP, 12345);
+    socket.write('stop_recording');
+    socket.listen((data) {
+      print(String.fromCharCodes(data));
+    });
+    setState(() {
+      isRecording = false;
+    });
+  }
+
   @override
   void dispose() {
     _debounceTimer?.cancel();
@@ -244,8 +268,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
     });
   }
 
-  void errorMsg() {}
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -278,30 +300,38 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
           // 左上角連線按鈕和狀態
           Positioned(
             top: 30,
-            left: 30,
+            left: 10,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(
                   children: [
-                    IconButton(onPressed: (){
-                      Navigator.push(context, MaterialPageRoute(builder: (context) => Home()));
-                    }, icon: Icon(Icons.arrow_back_ios_new,color: Colors.white,)),
+                    IconButton(
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (context) => Home()),
+                        );
+                      },
+                      icon: Icon(Icons.arrow_back_ios_new, color: Colors.white),
+                    ),
                     const SizedBox(width: 12),
                     // WebSocket 連線按鈕
                     ElevatedButton(
                       onPressed: _toggleWebSocketConnection,
                       style: ElevatedButton.styleFrom(
-                        backgroundColor:
-                            isWebSocketConnected ? Colors.green : Colors.red,
+                        backgroundColor: Colors.transparent,
                         padding: const EdgeInsets.symmetric(
                           horizontal: 20,
                           vertical: 10,
                         ),
                       ),
-                      child: Text(
-                        isWebSocketConnected ? 'WebSocket 開啟' : 'WebSocket 關閉',
-                        style: const TextStyle(color: Colors.white),
+                      child: Icon(
+                        isWebSocketConnected
+                            ? Icons.signal_wifi_4_bar_outlined
+                            : Icons.signal_wifi_bad_outlined,
+                        color: isWebSocketConnected ? Colors.green : Colors.red,
+                        size: 30,
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -309,17 +339,40 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                     ElevatedButton(
                       onPressed: _toggleCameraConnection,
                       style: ElevatedButton.styleFrom(
-                        backgroundColor:
-                            isStreamLoaded ? Colors.green : Colors.red,
+                        backgroundColor: Colors.transparent,
                         padding: const EdgeInsets.symmetric(
                           horizontal: 12,
                           vertical: 8,
                         ),
                       ),
-                      child: Text(
-                        isStreamLoaded ? '攝影機開啟' : '攝影機關閉',
-                        style: const TextStyle(color: Colors.white),
+                      child: Icon(
+                        isStreamLoaded
+                            ? Icons.cast_connected
+                            : Icons.cast_connected_outlined,
+                        color: isStreamLoaded ? Colors.green : Colors.red,
+                        size: 30,
                       ),
+                    ),
+                    const SizedBox(width: 450),
+                    // 右上角錄影控制
+                    Column(
+                      children: [
+                        RecordButton(
+                          isRecording: isRecording,
+                          onTap: () {
+                            setState(() {
+                              isRecording = !isRecording;
+                            });
+                            if (isRecording) {
+                              startRecording();
+                            } else {
+                              stopRecording();
+                            }
+                          },
+                        ),
+                        // SizedBox(height: 10,),
+                        // Text("00:00",style: TextStyle(color: Colors.white),)
+                      ],
                     ),
                   ],
                 ),
@@ -351,7 +404,8 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children:
-                            errorMessages.map(
+                            errorMessages
+                                .map(
                                   (msg) => Padding(
                                     padding: const EdgeInsets.only(bottom: 4),
                                     child: Text(
@@ -363,7 +417,8 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                                       ),
                                     ),
                                   ),
-                                ).toList(),
+                                )
+                                .toList(),
                       ),
                     ),
                   ),
@@ -429,7 +484,8 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                         x,
                         y,
                       ),
-                  onEnd: () => setState(() {
+                  onEnd:
+                      () => setState(() {
                         forward = lateral = 0;
                         if (isWebSocketConnected) {
                           _controller.startSendingControl(throttle, yaw, 0, 0);
@@ -463,16 +519,16 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
           padding: const EdgeInsets.all(6),
           child: Joystick(
             stick: Container(
-              width: 80,
-              height: 80,
+              width: 60,
+              height: 60,
               decoration: const BoxDecoration(
                 shape: BoxShape.circle,
                 color: Color.fromARGB(180, 255, 255, 255),
               ),
             ),
             base: Container(
-              width: 200,
-              height: 200,
+              width: 150,
+              height: 150,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 color: Colors.grey.withOpacity(0.5),
@@ -501,10 +557,103 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
       ),
       child: Row(
         children: [
-          Icon(icon, size: 20, color: isWebSocketConnected ? Colors.white : Colors.transparent),
+          Icon(
+            icon,
+            size: 20,
+            color: isWebSocketConnected ? Colors.white : Colors.transparent,
+          ),
           const SizedBox(width: 6),
-          Text(label, style: TextStyle(color: isWebSocketConnected ? Colors.white : Colors.transparent)),
+          Text(
+            label,
+            style: TextStyle(
+              color: isWebSocketConnected ? Colors.white : Colors.transparent,
+            ),
+          ),
         ],
+      ),
+    );
+  }
+}
+
+class RecordButton extends StatefulWidget {
+  final bool isRecording;
+  final VoidCallback onTap;
+
+  const RecordButton({
+    super.key,
+    required this.isRecording,
+    required this.onTap,
+  });
+
+  @override
+  State<RecordButton> createState() => _RecordButtonState();
+}
+
+class _RecordButtonState extends State<RecordButton>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _sizeAnim;
+  late Animation<BorderRadius?> _borderAnim;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 200),
+      vsync: this,
+    );
+
+    _sizeAnim = Tween<double>(begin: 50, end: 30).animate(_controller);
+    _borderAnim = BorderRadiusTween(
+      begin: BorderRadius.circular(25),
+      end: BorderRadius.circular(6),
+    ).animate(_controller);
+
+    if (widget.isRecording) _controller.forward();
+  }
+
+  @override
+  void didUpdateWidget(covariant RecordButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isRecording != oldWidget.isRecording) {
+      widget.isRecording ? _controller.forward() : _controller.reverse();
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: widget.onTap,
+      child: Container(
+        width: 60,
+        height: 60,
+        padding: const EdgeInsets.all(6),
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white, width: 4),
+        ),
+        child: AnimatedBuilder(
+          animation: _controller,
+          builder: (context, child) {
+            return Center(
+              child: Container(
+                width: _sizeAnim.value,
+                height: _sizeAnim.value,
+                decoration: BoxDecoration(
+                  color: Colors.red,
+                  borderRadius: _borderAnim.value,
+                ),
+              ),
+            );
+          },
+        ),
       ),
     );
   }
