@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
-import 'package:drone/main.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_joystick/flutter_joystick.dart';
@@ -23,6 +23,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
   double yaw = 0.0;
   double forward = 0.0;
   double lateral = 0.0;
+  double servoAngle = 90.0; // Initial servo angle
   bool isCameraConnected = false;
   bool isStreamLoaded = false;
   bool isWebSocketConnected = false;
@@ -36,7 +37,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
   int _retries = 0;
   final int maxRetries = 5;
   bool isRecording = false;
-  bool modeChanged = false;
 
   @override
   void initState() {
@@ -47,10 +47,13 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
     ]);
 
     _controller = DroneController(
-      onStatusChanged: (status, connected) {
+      onStatusChanged: (status, connected, [angle]) {
         setState(() {
           isWebSocketConnected = connected;
           connectionStatus = status;
+          if (angle != null && angle >= 0 && angle <= 180) {
+            servoAngle = angle; // Only update if valid
+          }
           if (status.contains('Error') || status.contains('Disconnected')) {
             errorMessages.add(status);
             if (errorMessages.length > 5) errorMessages.removeAt(0);
@@ -58,6 +61,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
         });
       },
     );
+    _controller.connect();
     _connectToStream();
   }
 
@@ -101,7 +105,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
 
     List<int> buffer = [];
     _socketSubscription = _socket!.listen(
-      (data) {
+          (data) {
         try {
           buffer.addAll(data);
           int start, end;
@@ -109,15 +113,13 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
               (end = _findJpegEnd(buffer, start)) != -1) {
             final frame = buffer.sublist(start, end + 2);
             buffer = buffer.sublist(end + 2);
-
             setState(() {
               _currentFrame = Uint8List.fromList(frame);
               isCameraConnected = true;
               errorMessages.removeWhere((msg) => msg.contains('正在連接到視訊串流'));
+              log.info('Received video frame: ${frame.length} bytes');
             });
           }
-
-          // 適應 640x480、10fps（每幀約 10-20KB）
           if (buffer.length > 50000) {
             buffer = buffer.sublist(buffer.length - 25000);
             log.warning('緩衝區過大，已裁剪至 ${buffer.length} 位元組');
@@ -189,7 +191,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
 
   int _findJpegEnd(List<int> data, int start) {
     for (int i = start; i < data.length - 1; i++) {
-      if (data[i] == 0xFF && data[i + 1] == 0xD9) return i + 1;
+      if (data[i] == 0xFF && data[i + 1] == 0xD9) return i;
     }
     return -1;
   }
@@ -214,38 +216,41 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
   }
 
   void startRecording() async {
-    final Socket socket = await Socket.connect(AppConfig.droneIP, 12345);
-    socket.write('start_recording');
-    socket.listen((data) {
-      print(String.fromCharCodes(data));
-    });
-    setState(() {
-      isRecording = true;
-    });
+    try {
+      final socket = await Socket.connect(AppConfig.droneIP, 12345);
+      socket.write('start_recording');
+      socket.listen((data) {
+        log.info('Recording response: ${String.fromCharCodes(data)}');
+      });
+      setState(() {
+        isRecording = true;
+      });
+    } catch (e) {
+      log.severe('Failed to start recording: $e');
+      setState(() {
+        errorMessages.add('錄影啟動失敗：$e');
+        if (errorMessages.length > 5) errorMessages.removeAt(0);
+      });
+    }
   }
 
   void stopRecording() async {
-    final Socket socket = await Socket.connect(AppConfig.droneIP, 12345);
-    socket.write('stop_recording');
-    socket.listen((data) {
-      print(String.fromCharCodes(data));
-    });
-    setState(() {
-      isRecording = false;
-    });
-  }
-
-  @override
-  void dispose() {
-    _debounceTimer?.cancel();
-    _reconnectTimer?.cancel();
-    _controller.dispose();
-    _disconnectFromStream();
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.portraitDown,
-    ]);
-    super.dispose();
+    try {
+      final socket = await Socket.connect(AppConfig.droneIP, 12345);
+      socket.write('stop_recording');
+      socket.listen((data) {
+        log.info('Recording response: ${String.fromCharCodes(data)}');
+      });
+      setState(() {
+        isRecording = false;
+      });
+    } catch (e) {
+      log.severe('Failed to stop recording: $e');
+      setState(() {
+        errorMessages.add('錄影停止失敗：$e');
+        if (errorMessages.length > 5) errorMessages.removeAt(0);
+      });
+    }
   }
 
   void _updateControlValues(JoystickMode mode, double x, double y) {
@@ -268,36 +273,81 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
     });
   }
 
+  void _updateServoAngle(double delta) {
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 100), () {
+      setState(() {
+        double newAngle = (servoAngle - delta).clamp(0, 180);
+        if ((newAngle - servoAngle).abs() > 0.5) { // Higher threshold for stability
+          servoAngle = newAngle;
+          if (isWebSocketConnected) {
+            _controller.sendServoControl(servoAngle);
+            log.info('Servo angle updated: $servoAngle°');
+          }
+        }
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _debounceTimer?.cancel();
+    _reconnectTimer?.cancel();
+    _controller.dispose();
+    _disconnectFromStream();
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // 視訊背景
+          // Video background (rotated 180 degrees)
           _currentFrame != null
-              ? Image.memory(
-                _currentFrame!,
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
-                errorBuilder:
-                    (context, error, stackTrace) => Container(
-                      color: Colors.black,
-                      child: const Center(
-                        child: Text(
-                          '視訊解碼錯誤',
-                          style: TextStyle(color: Colors.white),
-                        ),
-                      ),
-                    ),
-              )
-              : Container(
+              ? Transform.rotate(
+            angle: math.pi, // Rotate 180 degrees to flip upside down
+            child: Image.memory(
+              _currentFrame!,
+              fit: BoxFit.cover,
+              gaplessPlayback: true,
+              errorBuilder: (context, error, stackTrace) => Container(
                 color: Colors.black,
-                child: const Center(child: CircularProgressIndicator()),
+                child: const Center(
+                  child: Text(
+                    '視訊解碼錯誤',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                ),
               ),
-          // 半透明覆蓋層
+            ),
+          )
+              : Container(
+            color: Colors.black,
+            child: const Center(child: CircularProgressIndicator()),
+          ),
+          // Semi-transparent overlay
           Container(color: Colors.black.withOpacity(0.3)),
-          // 左上角連線按鈕和狀態
+          // Gesture area for servo control (higher priority)
+          Positioned(
+            left: MediaQuery.of(context).size.width * 0.20,
+            right: MediaQuery.of(context).size.width * 0.20,
+            top: 0,
+            bottom: 0,
+            child: GestureDetector(
+              onVerticalDragUpdate: (details) {
+                double delta = details.delta.dy * 1.0; // 1 pixel = 1°
+                log.info('Vertical drag detected: delta=$delta');
+                _updateServoAngle(delta);
+              },
+            ),
+          ),
+          // Top-left connection buttons and status
           Positioned(
             top: 30,
             left: 10,
@@ -308,23 +358,16 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                   children: [
                     IconButton(
                       onPressed: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(builder: (context) => Home()),
-                        );
+                        Navigator.pop(context);
                       },
-                      icon: Icon(Icons.arrow_back_ios_new, color: Colors.white),
+                      icon: const Icon(Icons.arrow_back_ios_new, color: Colors.white),
                     ),
                     const SizedBox(width: 12),
-                    // WebSocket 連線按鈕
                     ElevatedButton(
                       onPressed: _toggleWebSocketConnection,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.transparent,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 20,
-                          vertical: 10,
-                        ),
+                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
                       ),
                       child: Icon(
                         isWebSocketConnected
@@ -335,15 +378,11 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                       ),
                     ),
                     const SizedBox(width: 12),
-                    // 攝影機連線按鈕
                     ElevatedButton(
                       onPressed: _toggleCameraConnection,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.transparent,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 8,
-                        ),
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                       ),
                       child: Icon(
                         isStreamLoaded
@@ -354,7 +393,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                       ),
                     ),
                     const SizedBox(width: 450),
-                    // 右上角錄影控制
                     Column(
                       children: [
                         RecordButton(
@@ -370,8 +408,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                             }
                           },
                         ),
-                        // SizedBox(height: 10,),
-                        // Text("00:00",style: TextStyle(color: Colors.white),)
                       ],
                     ),
                   ],
@@ -381,14 +417,10 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                   '狀態：$connectionStatus',
                   style: const TextStyle(color: Colors.white70, fontSize: 12),
                 ),
-                // 連線狀態
                 if (errorMessages.isNotEmpty)
                   Container(
                     margin: const EdgeInsets.only(top: 6),
-                    constraints: const BoxConstraints(
-                      maxWidth: 300,
-                      maxHeight: 100, // 限制高度讓它可以滑動
-                    ),
+                    constraints: const BoxConstraints(maxWidth: 300, maxHeight: 100),
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
                       borderRadius: BorderRadius.circular(12),
@@ -403,94 +435,118 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
                     child: SingleChildScrollView(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
-                        children:
-                            errorMessages
-                                .map(
-                                  (msg) => Padding(
-                                    padding: const EdgeInsets.only(bottom: 4),
-                                    child: Text(
-                                      msg,
-                                      style: const TextStyle(
-                                        color: Colors.redAccent,
-                                        fontSize: 12,
-                                        height: 0.9,
-                                      ),
-                                    ),
-                                  ),
-                                )
-                                .toList(),
+                        children: errorMessages
+                            .map((msg) => Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Text(
+                            msg,
+                            style: const TextStyle(
+                              color: Colors.redAccent,
+                              fontSize: 12,
+                              height: 0.9,
+                            ),
+                          ),
+                        ))
+                            .toList(),
                       ),
                     ),
                   ),
               ],
             ),
           ),
-          // 底部控制區域
+          // Bottom control area
           Positioned(
             bottom: 24,
             left: 16,
             right: 16,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            child: Column(
               children: [
-                // 左搖桿
-                _buildJoystickOverlay(
-                  // label: '油門 ${throttle.toStringAsFixed(1)} | 偏航 ${yaw.toStringAsFixed(1)}',
-                  mode: JoystickMode.all,
-                  onUpdate:
-                      (x, y) => _updateControlValues(JoystickMode.all, x, y),
-                  onEnd:
-                      () => setState(() {
-                        throttle = yaw = 0;
-                        if (isWebSocketConnected) {
-                          _controller.startSendingControl(
-                            0,
-                            0,
-                            forward,
-                            lateral,
-                          );
-                        }
-                      }),
-                ),
-                // 動作按鈕
+                // Servo motor control (vertical slider)
                 Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    _actionButton(
-                      Icons.flight_takeoff,
-                      '啟動',
-                      isWebSocketConnected ? Colors.green : Colors.transparent,
-                      isWebSocketConnected
-                          ? () => _controller.sendCommand('ARM')
-                          : null,
+                    Text(
+                      '馬達角度: ${servoAngle.round()}°',
+                      style: const TextStyle(color: Colors.white, fontSize: 16),
                     ),
-                    const SizedBox(width: 12),
-                    _actionButton(
-                      Icons.flight_land,
-                      '解除',
-                      isWebSocketConnected ? Colors.red : Colors.transparent,
-                      isWebSocketConnected
-                          ? () => _controller.sendCommand('DISARM')
-                          : null,
+                    const SizedBox(width: 20),
+                    SizedBox(
+                      height: 200,
+                      child: RotatedBox(
+                        quarterTurns: 3,
+                        child: Slider(
+                          value: servoAngle,
+                          min: 0,
+                          max: 180,
+                          divisions: 180,
+                          label: servoAngle.round().toString(),
+                          activeColor: Colors.blue,
+                          inactiveColor: Colors.grey,
+                          onChanged: isWebSocketConnected
+                              ? (value) {
+                            setState(() {
+                              servoAngle = value;
+                            });
+                            _updateServoAngle(0); // Trigger debounced update
+                          }
+                              : null,
+                        ),
+                      ),
                     ),
                   ],
                 ),
-                // 右搖桿
-                _buildJoystickOverlay(
-                  // label: '前進 ${forward.toStringAsFixed(1)} | 橫移 ${lateral.toStringAsFixed(1)}',
-                  mode: JoystickMode.horizontalAndVertical,
-                  onUpdate:
-                      (x, y) => _updateControlValues(
-                        JoystickMode.horizontalAndVertical,
-                        x,
-                        y,
-                      ),
-                  onEnd:
-                      () => setState(() {
-                        forward = lateral = 0;
-                        if (isWebSocketConnected) {
-                          _controller.startSendingControl(throttle, yaw, 0, 0);
-                        }
-                      }),
+                const SizedBox(height: 20),
+                // Joysticks and buttons
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    _buildJoystickOverlay(
+                      mode: JoystickMode.all,
+                      onUpdate: (x, y) => _updateControlValues(JoystickMode.all, x, y),
+                      onEnd: () {
+                        setState(() {
+                          throttle = yaw = 0;
+                          if (isWebSocketConnected) {
+                            _controller.startSendingControl(0, 0, forward, lateral);
+                          }
+                        });
+                      },
+                    ),
+                    Row(
+                      children: [
+                        _actionButton(
+                          Icons.flight_takeoff,
+                          '啟動',
+                          isWebSocketConnected ? Colors.green : Colors.grey,
+                          isWebSocketConnected
+                              ? () => _controller.sendCommand('ARM')
+                              : null,
+                        ),
+                        const SizedBox(width: 12),
+                        _actionButton(
+                          Icons.flight_land,
+                          '解除',
+                          isWebSocketConnected ? Colors.red : Colors.grey,
+                          isWebSocketConnected
+                              ? () => _controller.sendCommand('DISARM')
+                              : null,
+                        ),
+                      ],
+                    ),
+                    _buildJoystickOverlay(
+                      mode: JoystickMode.horizontalAndVertical,
+                      onUpdate: (x, y) =>
+                          _updateControlValues(JoystickMode.horizontalAndVertical, x, y),
+                      onEnd: () {
+                        setState(() {
+                          forward = lateral = 0;
+                          if (isWebSocketConnected) {
+                            _controller.startSendingControl(throttle, yaw, 0, 0);
+                          }
+                        });
+                      },
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -501,7 +557,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
   }
 
   Widget _buildJoystickOverlay({
-    // required String label,
     required JoystickMode mode,
     required void Function(double, double) onUpdate,
     required VoidCallback onEnd,
@@ -509,8 +564,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        // Text(label, style: const TextStyle(color: Colors.white70)),
-        const SizedBox(height: 8),
         Container(
           decoration: BoxDecoration(
             color: Colors.black54,
@@ -543,11 +596,11 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
   }
 
   Widget _actionButton(
-    IconData icon,
-    String label,
-    Color color,
-    VoidCallback? onTap,
-  ) {
+      IconData icon,
+      String label,
+      Color color,
+      VoidCallback? onTap,
+      ) {
     return ElevatedButton(
       onPressed: onTap,
       style: ElevatedButton.styleFrom(
@@ -557,18 +610,9 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> {
       ),
       child: Row(
         children: [
-          Icon(
-            icon,
-            size: 20,
-            color: isWebSocketConnected ? Colors.white : Colors.transparent,
-          ),
+          Icon(icon, size: 20, color: Colors.white),
           const SizedBox(width: 6),
-          Text(
-            label,
-            style: TextStyle(
-              color: isWebSocketConnected ? Colors.white : Colors.transparent,
-            ),
-          ),
+          Text(label, style: const TextStyle(color: Colors.white)),
         ],
       ),
     );
@@ -589,8 +633,7 @@ class RecordButton extends StatefulWidget {
   State<RecordButton> createState() => _RecordButtonState();
 }
 
-class _RecordButtonState extends State<RecordButton>
-    with SingleTickerProviderStateMixin {
+class _RecordButtonState extends State<RecordButton> with SingleTickerProviderStateMixin {
   late AnimationController _controller;
   late Animation<double> _sizeAnim;
   late Animation<BorderRadius?> _borderAnim;
@@ -598,18 +641,15 @@ class _RecordButtonState extends State<RecordButton>
   @override
   void initState() {
     super.initState();
-
     _controller = AnimationController(
       duration: const Duration(milliseconds: 200),
       vsync: this,
     );
-
     _sizeAnim = Tween<double>(begin: 50, end: 30).animate(_controller);
     _borderAnim = BorderRadiusTween(
       begin: BorderRadius.circular(25),
       end: BorderRadius.circular(6),
     ).animate(_controller);
-
     if (widget.isRecording) _controller.forward();
   }
 

@@ -6,7 +6,7 @@ import 'constants.dart';
 
 class DroneController {
   final Logger log = Logger('DroneController');
-  final Function(String, bool) onStatusChanged;
+  final Function(String, bool, [double?]) onStatusChanged;
   IOWebSocketChannel? _channel;
   Timer? _reconnectTimer;
   Timer? _controlTimer;
@@ -17,10 +17,10 @@ class DroneController {
 
   DroneController({required this.onStatusChanged});
 
-  void _updateStatus(String status, bool connected) {
+  void _updateStatus(String status, bool connected, [double? angle]) {
     _isWebSocketConnected = connected;
     connectionStatus = status;
-    onStatusChanged(status, connected);
+    onStatusChanged(status, connected, angle);
   }
 
   Future<void> connect() async {
@@ -33,7 +33,7 @@ class DroneController {
     _channel = null;
     _reconnectTimer?.cancel();
 
-    String trimmedIP = AppConfig.droneIP.trim(); // 修剪 IP 地址
+    String trimmedIP = AppConfig.droneIP.trim();
     log.info('Attempting connection to ws://$trimmedIP:${AppConfig.websocketPort} (Retry $_retries/$maxRetries)');
     try {
       _updateStatus('Connecting...', false);
@@ -48,8 +48,12 @@ class DroneController {
       _channel!.stream.listen(
             (data) {
           log.info('Data received: $data');
-          _updateStatus('Connected', true);
-          _retries = 0;
+          var response = jsonDecode(data);
+          if (response['status'] == 'received') {
+            _updateStatus('Connected', true, response['angle']?.toDouble());
+          } else if (response['status'] == 'error') {
+            _updateStatus('Error: ${response['message']}', true);
+          }
         },
         onDone: () {
           log.warning('WebSocket closed: ${_channel?.closeCode} ${_channel?.closeReason}');
@@ -95,13 +99,23 @@ class DroneController {
     log.info('Sent command: $message');
   }
 
-  void startSendingControl(double throttle, double yaw, double forward, double lateral) {
-    _controlTimer?.cancel();
+  void sendServoControl(double angle) {
     if (!_isWebSocketConnected || _channel == null) {
-      log.warning('Cannot send control: WebSocket not connected');
+      log.warning('Cannot send servo control: WebSocket not connected');
       return;
     }
+    final message = jsonEncode({'type': 'servo_control', 'angle': angle});
+    _channel!.sink.add(message);
+    log.info('Sent servo control: $message');
+  }
+
+  void startSendingControl(double throttle, double yaw, double forward, double lateral) {
+    _controlTimer?.cancel();
     _controlTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      if (!_isWebSocketConnected || _channel == null) {
+        timer.cancel();
+        return;
+      }
       final message = jsonEncode({
         'type': 'control',
         'throttle': throttle,
@@ -110,7 +124,7 @@ class DroneController {
         'lateral': lateral,
       });
       _channel!.sink.add(message);
-      log.fine('Sent control: $message');
+      // log.debug('Sent control: $message');
     });
   }
 
