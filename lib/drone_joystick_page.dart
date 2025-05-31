@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'package:drone/main.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_joystick/flutter_joystick.dart';
@@ -24,15 +25,8 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
   String selectedMode = '顯示加控制';
 
   // 控制變數
-  double throttle = 0.0;
-  double yaw = 0.0;
-  double forward = 0.0;
-  double lateral = 0.0;
-  double servoSpeed = 0.0; // 馬達速度，範圍 -1.0 到 1.0
-  bool isCameraConnected = false;
-  bool isStreamLoaded = false;
-  bool isWebSocketConnected = false;
-  bool isRecording = false;
+  double throttle = 0.0, yaw = 0.0, forward = 0.0, lateral = 0.0, servoSpeed = 0.0;
+  bool isCameraConnected = false, isStreamLoaded = false, isWebSocketConnected = false, isRecording = false;
 
   // 其他狀態
   Timer? _debounceTimer;
@@ -43,32 +37,17 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
   @override
   void initState() {
     super.initState();
-    // 設定螢幕為橫向
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
+    SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
 
-    // 初始化脈衝動畫（用於載入指示器）
-    _pulseController = AnimationController(
-      duration: const Duration(seconds: 2),
-      vsync: this,
-    );
-    _pulseAnimation = Tween<double>(begin: 0.8, end: 1.2).animate(
-      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
-    );
+    _pulseController = AnimationController(duration: const Duration(seconds: 2), vsync: this);
+    _pulseAnimation = Tween<double>(begin: 0.8, end: 1.2).animate(CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut));
     _pulseController.repeat(reverse: true);
 
-    // 初始化 DroneController
     _controller = DroneController(
       onStatusChanged: (status, connected, [speed]) {
         setState(() {
           isWebSocketConnected = connected;
-          log.info('WebSocket status: $status, connected: $connected');
-          if (speed != null && speed >= -1.0 && speed <= 1.0) {
-            servoSpeed = speed;
-            log.info('Updated servo speed from server: ${servoSpeed * 100}%');
-          }
+          if (speed != null && speed >= -1.0 && speed <= 1.0) servoSpeed = speed;
         });
       },
     );
@@ -76,87 +55,46 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
     _connectToStream();
   }
 
-  // 連接到視訊串流
   void _connectToStream() async {
     if (_socket != null) return;
-
-    setState(() {
-      isStreamLoaded = true;
-      isCameraConnected = false;
-    });
+    setState(() => isStreamLoaded = true);
 
     try {
-      _socket = await Socket.connect(
-        AppConfig.droneIP,
-        AppConfig.videoPort,
-        timeout: const Duration(seconds: 5),
-      );
-      log.info('成功連接到視訊串流：${AppConfig.droneIP}:${AppConfig.videoPort}');
+      _socket = await Socket.connect(AppConfig.droneIP, AppConfig.videoPort, timeout: const Duration(seconds: 5));
     } catch (e) {
-      setState(() {
-        isStreamLoaded = false;
-        isCameraConnected = false;
-      });
-      log.severe('連線失敗：$e');
+      setState(() => isStreamLoaded = isCameraConnected = false);
       return;
     }
 
     List<int> buffer = [];
     _socketSubscription = _socket!.listen(
           (data) {
-        try {
-          buffer.addAll(data);
-          int start, end;
-          while ((start = _findJpegStart(buffer)) != -1 && (end = _findJpegEnd(buffer, start)) != -1) {
-            final frame = buffer.sublist(start, end + 2);
-            buffer = buffer.sublist(end + 2);
-            setState(() {
-              _currentFrame = Uint8List.fromList(frame);
-              isCameraConnected = true;
-            });
-          }
-          if (buffer.length > 200000) {
-            buffer = buffer.sublist(buffer.length - 100000);
-            log.warning('緩衝區過大，已裁剪至 ${buffer.length} 位元組');
-          }
-        } catch (e) {
-          log.severe('處理串流數據時出錯：$e');
+        buffer.addAll(data);
+        int start, end;
+        while ((start = _findJpegStart(buffer)) != -1 && (end = _findJpegEnd(buffer, start)) != -1) {
+          final frame = buffer.sublist(start, end + 2);
+          buffer = buffer.sublist(end + 2);
+          setState(() {
+            _currentFrame = Uint8List.fromList(frame);
+            isCameraConnected = true;
+          });
         }
+        if (buffer.length > 200000) buffer = buffer.sublist(buffer.length - 100000);
       },
-      onError: (error) {
-        log.severe('串流錯誤：$error');
-        setState(() {
-          isCameraConnected = false;
-          isStreamLoaded = false;
-        });
-        _disconnectFromStream();
-      },
-      onDone: () {
-        log.warning('串流已關閉');
-        setState(() {
-          isCameraConnected = false;
-          isStreamLoaded = false;
-        });
-        _disconnectFromStream();
-      },
+      onError: (_) => _disconnectFromStream(),
+      onDone: () => _disconnectFromStream(),
       cancelOnError: true,
     );
   }
 
-  // 斷開視訊串流
   void _disconnectFromStream() {
     _socketSubscription?.cancel();
     _socket?.close();
     _socket = null;
     _socketSubscription = null;
-    setState(() {
-      isStreamLoaded = false;
-      isCameraConnected = false;
-      _currentFrame = null;
-    });
+    setState(() => isStreamLoaded = isCameraConnected = false);
   }
 
-  // 尋找 JPEG 起始標記
   int _findJpegStart(List<int> data) {
     for (int i = 0; i < data.length - 1; i++) {
       if (data[i] == 0xFF && data[i + 1] == 0xD8) return i;
@@ -164,7 +102,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
     return -1;
   }
 
-  // 尋找 JPEG 結束標記
   int _findJpegEnd(List<int> data, int start) {
     for (int i = start; i < data.length - 1; i++) {
       if (data[i] == 0xFF && data[i + 1] == 0xD9) return i;
@@ -172,431 +109,84 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
     return -1;
   }
 
-  // 切換 WebSocket 連線
-  void _toggleWebSocketConnection() {
-    if (isWebSocketConnected) {
-      _controller.disconnect();
+  void _toggleConnection(bool isWebSocket) {
+    if (isWebSocket) {
+      isWebSocketConnected ? _controller.disconnect() : _controller.connect();
     } else {
-      _controller.connect();
+      (isStreamLoaded || _socket != null) ? _disconnectFromStream() : _connectToStream();
     }
   }
 
-  // 切換視訊串流連線
-  void _toggleCameraConnection() {
-    if (isStreamLoaded || _socket != null) {
-      _disconnectFromStream();
-    } else {
-      _connectToStream();
-    }
-  }
-
-  // 開始錄影
-  void startRecording() async {
+  void _handleRecording(bool start) async {
     try {
       final socket = await Socket.connect(AppConfig.droneIP, 12345);
-      socket.write('start_recording');
+      socket.write(start ? 'start_recording' : 'stop_recording');
       await socket.flush();
-      socket.listen((data) {
-        log.info('Recording response: ${String.fromCharCodes(data)}');
-        socket.close();
-      }, onDone: () {
-        socket.destroy();
-      });
-      setState(() {
-        isRecording = true;
-      });
+      socket.listen((data) => socket.close(), onDone: () => socket.destroy());
+      setState(() => isRecording = start);
     } catch (e) {
-      log.severe('Failed to start recording: $e');
+      log.severe('Recording ${start ? 'start' : 'stop'} failed: $e');
     }
   }
 
-  // 停止錄影
-  void stopRecording() async {
-    try {
-      final socket = await Socket.connect(AppConfig.droneIP, 12345);
-      socket.write('stop_recording');
-      await socket.flush();
-      socket.listen((data) {
-        log.info('Recording response: ${String.fromCharCodes(data)}');
-        socket.close();
-      }, onDone: () {
-        socket.destroy();
-      });
-      setState(() {
-        isRecording = false;
-      });
-    } catch (e) {
-      log.severe('Failed to stop recording: $e');
-    }
-  }
-
-  // 更新搖桿控制值
   void _updateControlValues(JoystickMode mode, double x, double y) {
     _debounceTimer?.cancel();
     _debounceTimer = Timer(const Duration(milliseconds: 20), () {
       setState(() {
         if (mode == JoystickMode.all) {
-          throttle = -y;
-          yaw = x;
+          throttle = -y; yaw = x;
         } else {
-          forward = -y;
-          lateral = x;
+          forward = -y; lateral = x;
         }
         if (isWebSocketConnected) {
           _controller.startSendingControl(throttle, yaw, forward, lateral);
-        } else {
-          _controller.stopSendingControl();
         }
       });
     });
   }
 
-  // 更新馬達速度
   void _updateServoSpeed(double newSpeed) {
-    setState(() {
-      final clampedSpeed = newSpeed.clamp(-1.0, 1.0);
-      if ((clampedSpeed - servoSpeed).abs() > 0.01) {
-        servoSpeed = clampedSpeed;
-        if (isWebSocketConnected) {
-          _controller.sendServoControl(servoSpeed);
-          log.info('Sending servo speed to controller: ${servoSpeed * 100}%');
-        } else {
-          log.warning('WebSocket not connected, servo command not sent');
-        }
-      }
-    });
+    final clampedSpeed = newSpeed.clamp(-1.0, 1.0);
+    if ((clampedSpeed - servoSpeed).abs() > 0.01) {
+      setState(() => servoSpeed = clampedSpeed);
+      if (isWebSocketConnected) _controller.sendServoControl(servoSpeed);
+    }
   }
 
-  // 顯示菜單對話框
   void _showMenuDialog() {
     showDialog(
       context: context,
       barrierDismissible: true,
-      builder: (BuildContext dialogContext) {
-        String selectedMenu = '設定'; // 定義在外部以保持狀態
-
-        return Align(
-          alignment: Alignment.centerRight,
-          child: Material(
-            color: Colors.transparent,
-            child: Container(
-              width: 400,
-              // 使用動態高度，根據內容調整，避免固定高度導致的溢出
-              constraints: BoxConstraints(
-                maxHeight: MediaQuery.of(dialogContext).size.height * 0.95,
-              ),
-              margin: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                color: Colors.grey.withOpacity(0.5),
-                borderRadius: const BorderRadius.all(Radius.circular(20)),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.5),
-                    blurRadius: 10,
-                    offset: const Offset(-5, 0),
-                  ),
-                ],
-              ),
-              child: StatefulBuilder(
-                builder: (BuildContext innerContext, StateSetter setState) {
-                  return Stack(
-                    children: [
-                      Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min, // 確保 Column 只佔用必要高度
-                        children: [
-                          // 菜單項目（左右滑動）
-                          SizedBox(
-                            height: 75, // 固定高度，如果出事這裡的問題
-                            child: ListView(
-                              scrollDirection: Axis.horizontal,
-                              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-                              children: [
-                                _MenuItem(
-                                  icon: Icons.settings,
-                                  title: '設定',
-                                  isSelected: selectedMenu == '設定',
-                                  onTap: () {
-                                    print('Clicked 設定');
-                                    setState(() {
-                                      selectedMenu = '設定';
-                                    });
-                                  },
-                                ),
-                                _MenuItem(
-                                  icon: Icons.info,
-                                  title: '資訊',
-                                  isSelected: selectedMenu == '資訊',
-                                  onTap: () {
-                                    print('Clicked 資訊');
-                                    setState(() {
-                                      selectedMenu = '資訊';
-                                    });
-                                  },
-                                ),
-                                _MenuItem(
-                                  icon: Icons.help,
-                                  title: '幫助',
-                                  isSelected: selectedMenu == '幫助',
-                                  onTap: () {
-                                    print('Clicked 幫助');
-                                    setState(() {
-                                      selectedMenu = '幫助';
-                                    });
-                                  },
-                                ),
-                              ],
-                            ),
-                          ),
-                          // 分隔線
-                          Container(
-                            margin: const EdgeInsets.symmetric(horizontal: 16.0),
-                            height: 1.0,
-                            color: Colors.white.withOpacity(0.3),
-                          ),
-                          // 動態內容區域（上下滑動）
-                          Expanded(
-                            child: SingleChildScrollView(
-                              padding: const EdgeInsets.all(12.0), // 減少 padding
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  if (selectedMenu == '設定') ..._buildSettingsUI(innerContext, selectedMode, (mode) {
-                                    setState(() {
-                                      selectedMode = mode;
-                                    });
-                                  }),
-                                  if (selectedMenu == '資訊') ..._buildInfoUI(innerContext),
-                                  if (selectedMenu == '幫助') ..._buildHelpUI(innerContext),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      // 浮動關閉按鈕
-                      Positioned(
-                        top: 8,
-                        right: 8,
-                        child: IconButton(
-                          icon: const Icon(Icons.close, color: Colors.white, size: 20),
-                          onPressed: () {
-                            Navigator.of(innerContext).pop();
-                          },
-                          style: IconButton.styleFrom(
-                            backgroundColor: Colors.black.withOpacity(0.3),
-                            shape: const CircleBorder(),
-                          ),
-                        ),
-                      ),
-                    ],
-                  );
-                },
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-// 自訂菜單項目小部件
-  Widget _MenuItem({
-    required IconData icon,
-    required String title,
-    required bool isSelected,
-    required VoidCallback onTap,
-  }) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        splashColor: Colors.white.withOpacity(0.3),
-        borderRadius: BorderRadius.circular(8),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                icon,
-                color: isSelected ? Colors.white : Colors.white70,
-                size: 28,
-              ),
-              const SizedBox(height: 4),
-              Text(
-                title,
-                style: TextStyle(
-                  color: isSelected ? Colors.white : Colors.white70,
-                  fontSize: 12,
-                  fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
-                ),
-              ),
-              if (isSelected)
-                Container(
-                  margin: const EdgeInsets.only(top: 4),
-                  height: 2,
-                  width: 20,
-                  color: Colors.white,
-                ),
-            ],
-          ),
-        ),
+      builder: (context) => _MenuDialog(
+          selectedMode: selectedMode,
+          onModeChanged: (mode) => setState(() => selectedMode = mode)
       ),
     );
   }
 
-// 設定頁面 UI
-  List<Widget> _buildSettingsUI(BuildContext context, String selectedMode, Function(String) onModeChanged) {
-    return [
-      const Text(
-        '設定',
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: 16,
-          fontWeight: FontWeight.bold,
-        ),
-      ),
-      const SizedBox(height: 8),
-      const ListTile(
-        leading: Icon(Icons.adjust, color: Colors.white),
-        title: Text('亮度調整', style: TextStyle(color: Colors.white)),
-      ),
-      const ListTile(
-        leading: Icon(Icons.vibration, color: Colors.white),
-        title: Text('震動反饋', style: TextStyle(color: Colors.white)),
-      ),
-      const SizedBox(height: 8),
-      const Text(
-        '模式選擇',
-        style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
-      ),
-      const SizedBox(height: 4),
-      Wrap(
-        spacing: 8.0,
-        children: [
-          _ModeOption(
-            label: '顯示加控制',
-            isSelected: selectedMode == '顯示加控制',
-            onTap: () => onModeChanged('顯示加控制'),
-          ),
-          _ModeOption(
-            label: '僅顯示',
-            isSelected: selectedMode == '僅顯示',
-            onTap: () => onModeChanged('僅顯示'),
-          ),
-          _ModeOption(
-            label: '協同作業',
-            isSelected: selectedMode == '協同作業',
-            onTap: () => onModeChanged('協同作業'),
-          ),
-        ],
-      ),
-    ];
+  // 根據模式判斷是否顯示組件的輔助方法
+  bool _shouldShowControls() {
+    return selectedMode == '顯示加控制' || selectedMode == '協同作業';
   }
 
-// 資訊頁面 UI
-  List<Widget> _buildInfoUI(BuildContext dialogContext) {
-    return [
-      const Text(
-        '應用資訊',
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: 16,
-          fontWeight: FontWeight.bold,
-        ),
-      ),
-      const SizedBox(height: 8), // 減少間距
-      const ListTile(
-        leading: Icon(Icons.info_outline, color: Colors.white),
-        title: Text('版本號: 2.4.6.8', style: TextStyle(color: Colors.white)),
-      ),
-      const ListTile(
-        leading: Icon(Icons.person, color: Colors.white),
-        title: Text('開發者: 資二甲 裊裊 Team', style: TextStyle(color: Colors.white)),
-      ),
-      ListTile(
-        leading: const Icon(Icons.email, color: Colors.white),
-        title: const Text('聯繫我們', style: TextStyle(color: Colors.white)),
-        onTap: () {
-          showDialog(
-            context: dialogContext,
-            builder: (context) => AlertDialog(
-              title: const Text('聯繫我們'),
-              content: const Text('請發送郵件至: jerrysh0227@gmail.com'),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('關閉'),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
-    ];
+  bool _shouldShowDisplayElements() {
+    return selectedMode == '顯示加控制' || selectedMode == '僅顯示';
   }
 
-// 幫助頁面 UI
-  List<Widget> _buildHelpUI(BuildContext dialogContext) {
-    return [
-      const Text(
-        '幫助與支援',
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: 16,
-          fontWeight: FontWeight.bold,
-        ),
-      ),
-      const SizedBox(height: 8), // 減少間距
-      const ListTile(
-        leading: Icon(Icons.book, color: Colors.white),
-        title: Text('使用手冊', style: TextStyle(color: Colors.white)),
-      ),
-      ListTile(
-        leading: const Icon(Icons.question_answer, color: Colors.white),
-        title: const Text('常見問題', style: TextStyle(color: Colors.white)),
-        onTap: () {
-          showDialog(
-            context: dialogContext,
-            builder: (context) => AlertDialog(
-              title: const Text('常見問題'),
-              content: const Text('Q: 如何連線無人機?\nA: 請確保藍牙已啟用並配對設備。'),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('關閉'),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
-      const ListTile(
-        leading: Icon(Icons.support, color: Colors.white),
-        title: Text('技術支援', style: TextStyle(color: Colors.white)),
-      ),
-    ];
+  bool _shouldShowOnlyJoysticks() {
+    return selectedMode == '協同作業';
+  }
+  bool _shouldShowRecordButton() {
+    return selectedMode == '顯示加控制' || selectedMode == '僅顯示';
   }
 
-
-
-  // ---彈窗結束---
-
-
-  //控制留白
   @override
   void dispose() {
     _debounceTimer?.cancel();
     _pulseController.dispose();
     _controller.dispose();
     _disconnectFromStream();
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.portraitDown,
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]); // 恢復所有方向
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     super.dispose();
   }
 
@@ -607,296 +197,122 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
         child: Stack(
           fit: StackFit.expand,
           children: [
-            _currentFrame != null
-                ? Transform.rotate(
-              angle: math.pi,
-              child: Image.memory(
-                _currentFrame!,
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
-                errorBuilder: (context, error, stackTrace) => Container(
-                  color: Colors.black,
-                  child: const Center(
-                    child: Text(
-                      '視訊解碼錯誤',
-                      style: TextStyle(color: Colors.white, fontSize: 16),
-                    ),
-                  ),
-                ),
-              ),
-            )
-                : Container(
-              color: Colors.black,
-              child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    AnimatedBuilder(
-                      animation: _pulseAnimation,
-                      builder: (context, child) {
-                        return Transform.scale(
-                          scale: _pulseAnimation.value,
-                          child: const CircularProgressIndicator(
-                            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                            strokeWidth: 3,
-                          ),
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 16),
-                    const Text(
-                      '',
-                      style: TextStyle(color: Colors.white70, fontSize: 14),
-                    ),
-                  ],
-                ),
-              ),
-            ),
+            _buildVideoDisplay(),
             Container(color: Colors.black.withOpacity(0.1)),
             _buildTopStatusBar(),
-            _buildBottomControlArea(),
-            _buildServoSlider(),
+            // 根據模式顯示不同的組件
+            if (_shouldShowControls()) _buildBottomControlArea(),
+            if (_shouldShowDisplayElements()) _buildServoSlider(),
+            // 獨立顯示 RecordButton
+            if (_shouldShowRecordButton()) _buildRecordButton(),
           ],
         ),
       ),
     );
   }
 
-  // 頂部狀態欄
-  Widget _buildTopStatusBar() {
-    return Positioned(
-      top: 0, // 移除硬編碼的 top: 20，讓 SafeArea 處理邊距
-      left: 16,
-      right: 16,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.6),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Row(
-          children: [
-            IconButton(
-              onPressed: () => Navigator.pop(context),
-              style: IconButton.styleFrom(
-                backgroundColor: Colors.white.withOpacity(0.15),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                padding: const EdgeInsets.all(10),
-              ),
-              icon: const Icon(Icons.arrow_back_ios_new, color: Colors.white, size: 20),
-            ),
-            const SizedBox(width: 10),
-            _buildConnectionButton(
-              icon: isWebSocketConnected ? Icons.wifi_rounded : Icons.wifi_off_rounded,
-              isConnected: isWebSocketConnected,
-              onPressed: _toggleWebSocketConnection,
-              tooltip: 'WebSocket連接',
-            ),
-            const SizedBox(width: 8),
-            _buildConnectionButton(
-              icon: isStreamLoaded ? Icons.videocam_rounded : Icons.videocam_off_rounded,
-              isConnected: isCameraConnected,
-              onPressed: _toggleCameraConnection,
-              tooltip: '視訊串流',
-            ),
-            const Spacer(),
-            RecordButton(
-              isRecording: isRecording,
-              onTap: () {
-                if (!isRecording) {
-                  startRecording();
-                } else {
-                  stopRecording();
-                }
-              },
-            ),
-            IconButton(
-              onPressed: _showMenuDialog,
-              style: IconButton.styleFrom(
-                backgroundColor: Colors.white.withOpacity(0.15),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                padding: const EdgeInsets.all(10),
-              ),
-              icon: const Icon(Icons.menu, color: Colors.white, size: 20),
-            ),
-          ],
-        ),
-      ),
-    );
+  Widget _buildVideoDisplay() {
+    return _currentFrame != null
+        ? Transform.rotate(
+      angle: math.pi,
+      child: Image.memory(_currentFrame!, fit: BoxFit.cover, gaplessPlayback: true,
+          errorBuilder: (_, __, ___) => _buildLoadingScreen('視訊解碼錯誤')),
+    )
+        : _buildLoadingScreen('');
   }
 
-  // 連線按鈕
-  Widget _buildConnectionButton({
-    required IconData icon,
-    required bool isConnected,
-    required VoidCallback onPressed,
-    required String tooltip,
-  }) {
-    Color activeColor = Colors.greenAccent.shade700;
-    Color inactiveColor = Colors.redAccent.shade400;
-    return Tooltip(
-      message: tooltip,
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: onPressed,
-          borderRadius: BorderRadius.circular(12),
-          child: Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: isConnected ? activeColor.withOpacity(0.25) : inactiveColor.withOpacity(0.25),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(
-                color: isConnected ? activeColor.withOpacity(0.5) : inactiveColor.withOpacity(0.5),
-                width: 1.5,
-              ),
-            ),
-            child: Icon(
-              icon,
-              color: isConnected ? activeColor : inactiveColor,
-              size: 22,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  // 伺服馬達滑桿
-  Widget _buildServoSlider() {
-    return Positioned(
-      left: 20,
-      top: 110,
-      child: Container(
-        height: 250,
-        width: 80,
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.6),
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.4),
-              blurRadius: 8,
-              offset: const Offset(0, 3),
-            ),
-          ],
-        ),
+  Widget _buildLoadingScreen(String error) {
+    return Container(
+      color: Colors.black,
+      child: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
+            if (error.isEmpty) AnimatedBuilder(
+              animation: _pulseAnimation,
+              builder: (_, __) => Transform.scale(
+                scale: _pulseAnimation.value,
+                child: const CircularProgressIndicator(valueColor: AlwaysStoppedAnimation<Color>(Colors.white), strokeWidth: 3),
+              ),
+            ),
+            if (error.isNotEmpty) Text(error, style: const TextStyle(color: Colors.white, fontSize: 16)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopStatusBar() {
+    return Positioned(
+      top: 0, left: 16, right: 16,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        decoration: BoxDecoration(color: Colors.black.withOpacity(0.6), borderRadius: BorderRadius.circular(16)),
+        child: Row(
+          children: [
+            _buildIconButton(Icons.arrow_back_ios_new, () => Navigator.push(context, MaterialPageRoute(builder: (_) => Home()))),
+            const SizedBox(width: 10),
+            // 在"僅顯示"模式下隱藏連接控制按鈕
+            if (selectedMode != '僅顯示') ...[
+              _buildConnectionButton(isWebSocketConnected ? Icons.wifi_rounded : Icons.wifi_off_rounded, isWebSocketConnected, () => _toggleConnection(true)),
+              const SizedBox(width: 8),
+              _buildConnectionButton(isStreamLoaded ? Icons.videocam_rounded : Icons.videocam_off_rounded, isCameraConnected, () => _toggleConnection(false)),
+            ],
+            const Spacer(),
+            _buildIconButton(Icons.menu, _showMenuDialog),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildIconButton(IconData icon, VoidCallback onPressed) {
+    return IconButton(
+      onPressed: onPressed,
+      style: IconButton.styleFrom(
+        backgroundColor: Colors.white.withOpacity(0.15),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        padding: const EdgeInsets.all(10),
+      ),
+      icon: Icon(icon, color: Colors.white, size: 20),
+    );
+  }
+
+  Widget _buildConnectionButton(IconData icon, bool isConnected, VoidCallback onPressed) {
+    final color = isConnected ? Colors.greenAccent.shade700 : Colors.redAccent.shade400;
+    return InkWell(
+      onTap: onPressed,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.25),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: color.withOpacity(0.5), width: 1.5),
+        ),
+        child: Icon(icon, color: color, size: 22),
+      ),
+    );
+  }
+
+  Widget _buildServoSlider() {
+    return Positioned(
+      left: 20, top: 110,
+      child: Container(
+        height: 250, width: 80,
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.6),
+          borderRadius: BorderRadius.circular(20),
+          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 8, offset: const Offset(0, 3))],
+        ),
+        child: Column(
+          children: [
             const Padding(
               padding: EdgeInsets.only(top: 16.0),
-              child: Text(
-                '馬達\n速度',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                  height: 1.2,
-                ),
-                textAlign: TextAlign.center,
-              ),
+              child: Text('雲台\n角度', style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold, height: 1.2), textAlign: TextAlign.center),
             ),
             const SizedBox(height: 16),
-            Expanded(
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final double painterTrackLength = constraints.maxHeight;
-                  final double painterVisualWidth = constraints.maxWidth;
-
-                  final double normalizedValue = (1.0 - servoSpeed) / 2.0;
-
-                  final textStyle = const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.bold,
-                  );
-                  final String textContent = '${(servoSpeed * 100).round()}%';
-                  final textPainter = TextPainter(
-                    text: TextSpan(text: textContent, style: textStyle),
-                    textDirection: TextDirection.ltr,
-                  );
-                  textPainter.layout(minWidth: 0, maxWidth: painterVisualWidth);
-                  final double textRenderHeight = textPainter.height;
-                  final double verticalPaddingInContainer = 4.0 * 2;
-                  final double actualTextContainerHeight = textRenderHeight + verticalPaddingInContainer;
-                  final double actualTextContainerHalfHeight = actualTextContainerHeight / 2.0;
-                  final double thumbCenterY = normalizedValue * painterTrackLength;
-                  final double textLabelTopPosition = thumbCenterY - actualTextContainerHalfHeight;
-                  final double thumbRadius = 10.0;
-                  final double spacingToTheRightOfThumb = 8.0;
-                  final double textLabelLeftPosition = (painterVisualWidth / 2) + thumbRadius + spacingToTheRightOfThumb;
-
-                  return Stack(
-                    alignment: Alignment.center,
-                    clipBehavior: Clip.none,
-                    children: [
-                      RotatedBox(
-                        quarterTurns: -1,
-                        child: CustomPaint(
-                          size: Size(painterTrackLength, painterVisualWidth),
-                          painter: ScalePainter(
-                            scaleTopValue: 1.0,
-                            scaleBottomValue: -1.0,
-                            tickColor: Colors.white60,
-                            tickStrokeWidth: 1.5,
-                            tickVisualLength: 12.0,
-                            zeroMarkColor: Colors.white,
-                            zeroMarkStrokeWidth: 2.5,
-                            zeroMarkVisualLength: 22.0,
-                          ),
-                        ),
-                      ),
-                      RotatedBox(
-                        quarterTurns: -1,
-                        child: SliderTheme(
-                          data: SliderTheme.of(context).copyWith(
-                            trackHeight: 6,
-                            thumbShape: RoundSliderThumbShape(enabledThumbRadius: thumbRadius),
-                            overlayShape: const RoundSliderOverlayShape(overlayRadius: 22),
-                            overlayColor: Colors.white.withOpacity(0.2),
-                            activeTrackColor: Colors.transparent,
-                            inactiveTrackColor: Colors.transparent,
-                            thumbColor: Colors.white,
-                            activeTickMarkColor: Colors.transparent,
-                            inactiveTickMarkColor: Colors.transparent,
-                            showValueIndicator: ShowValueIndicator.never,
-                          ),
-                          child: Slider(
-                            value: servoSpeed,
-                            min: -1.0,
-                            max: 1.0,
-                            divisions: 200,
-                            onChanged: (sliderRawValue) {
-                              _updateServoSpeed(sliderRawValue);
-                            },
-                          ),
-                        ),
-                      ),
-                      Positioned(
-                        top: textLabelTopPosition,
-                        left: textLabelLeftPosition,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withOpacity(0.8),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Text(
-                            textContent,
-                            style: textStyle,
-                          ),
-                        ),
-                      ),
-                    ],
-                  );
-                },
-              ),
-            ),
+            Expanded(child: _buildSliderWithScale()),
             const SizedBox(height: 16),
           ],
         ),
@@ -904,167 +320,380 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
     );
   }
 
-  // 底部控制區域
+  Widget _buildSliderWithScale() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return Stack(
+          alignment: Alignment.center,
+          clipBehavior: Clip.none,
+          children: [
+            RotatedBox(quarterTurns: -1, child: CustomPaint(size: Size(constraints.maxHeight, constraints.maxWidth), painter: ScalePainter())),
+            RotatedBox(
+              quarterTurns: -1,
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 6, thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 10),
+                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 22), overlayColor: Colors.white.withOpacity(0.2),
+                  activeTrackColor: Colors.transparent, inactiveTrackColor: Colors.transparent, thumbColor: Colors.white,
+                  activeTickMarkColor: Colors.transparent, inactiveTickMarkColor: Colors.transparent, showValueIndicator: ShowValueIndicator.never,
+                ),
+                child: Slider(
+                    value: servoSpeed,
+                    min: -1.0,
+                    max: 1.0,
+                    divisions: 200,
+                    // 在"僅顯示"模式下禁用滑桿控制
+                    onChanged: _shouldShowDisplayElements() ?  _updateServoSpeed : null
+                ),
+              ),
+            ),
+            _buildSpeedLabel(constraints),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildSpeedLabel(BoxConstraints constraints) {
+    final normalizedValue = (1.0 - servoSpeed) / 2.0;
+    final thumbCenterY = normalizedValue * constraints.maxHeight;
+    return Positioned(
+      top: thumbCenterY - 15,
+      left: (constraints.maxWidth / 2) + 18,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(color: Colors.transparent, borderRadius: BorderRadius.circular(6)),
+        child: Text('${(servoSpeed * 100).round()}°', style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
+      ),
+    );
+  }
+
   Widget _buildBottomControlArea() {
     return Positioned(
-      bottom: 16,
-      left: 110,
-      right: 100,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        crossAxisAlignment: CrossAxisAlignment.end,
+      bottom: 5, left: 110, right: 100,
+      child: Stack(
+        clipBehavior: Clip.none,
         children: [
-          _buildJoystickWithLabel(
-            label: '',
-            mode: JoystickMode.all,
-            onUpdate: (x, y) => _updateControlValues(JoystickMode.all, x, y),
-            onEnd: () {
-              setState(() {
-                throttle = yaw = 0;
-                if (isWebSocketConnected) {
-                  _controller.startSendingControl(0, 0, forward, lateral);
-                }
-              });
-            },
-          ),
-          Column(
-            mainAxisSize: MainAxisSize.min,
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _buildActionButton(
-                    Icons.flight_takeoff_rounded,
-                    '啟動',
-                    isWebSocketConnected ? Colors.greenAccent.shade700 : Colors.grey.shade700,
-                    isWebSocketConnected ? () => _controller.sendCommand('ARM') : null,
-                  ),
-                  const SizedBox(width: 10),
-                  _buildActionButton(
-                    Icons.flight_land_rounded,
-                    '解除',
-                    isWebSocketConnected ? Colors.redAccent.shade400 : Colors.grey.shade700,
-                    isWebSocketConnected ? () => _controller.sendCommand('DISARM') : null,
-                  ),
-                ],
-              ),
-              const SizedBox(height: 80),
+              _buildJoystickWithLabel('', (x, y) => _updateControlValues(JoystickMode.all, x, y), () => _resetControls(true)),
+              if (_shouldShowControls())
+                Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        _buildActionButton(Icons.flight_takeoff_rounded, '啟動', Colors.greenAccent.shade700, () => _controller.sendCommand('ARM')),
+                        const SizedBox(width: 10),
+                        _buildActionButton(Icons.flight_land_rounded, '解除', Colors.redAccent.shade400, () => _controller.sendCommand('DISARM')),
+                      ],
+                    ),
+                    const SizedBox(height: 80),
+                  ],
+                ),
+              _buildJoystickWithLabel('', (x, y) => _updateControlValues(JoystickMode.all, x, y), () => _resetControls(false)),
             ],
-          ),
-          _buildJoystickWithLabel(
-            label: '',
-            mode: JoystickMode.all,
-            onUpdate: (x, y) => _updateControlValues(JoystickMode.all, x, y),
-            onEnd: () {
-              setState(() {
-                forward = lateral = 0;
-                if (isWebSocketConnected) {
-                  _controller.startSendingControl(throttle, yaw, 0, 0);
-                }
-              });
-            },
           ),
         ],
       ),
     );
   }
 
-  // 搖桿與標籤
-  Widget _buildJoystickWithLabel({
-    required String label,
-    required JoystickMode mode,
-    required void Function(double, double) onUpdate,
-    required VoidCallback onEnd,
-  }) {
-    double xValue = (mode == JoystickMode.all && label == '油門/偏航') ? yaw : lateral;
-    double yValue = (mode == JoystickMode.all && label == '油門/偏航') ? throttle : forward;
+  Widget _buildRecordButton() {
+    return Positioned(
+      bottom: 155, // 調整位置，避免與其他元素重疊
+      right: 50,
+      child: RecordButton(
+        isRecording: isRecording,
+        onTap: () => _handleRecording(!isRecording),
+      ),
+    );
+  }
 
+
+  void _resetControls(bool isThrottle) {
+    setState(() {
+      if (isThrottle) {
+        throttle = yaw = 0;
+        if (isWebSocketConnected) _controller.startSendingControl(0, 0, forward, lateral);
+      } else {
+        forward = lateral = 0;
+        if (isWebSocketConnected) _controller.startSendingControl(throttle, yaw, 0, 0);
+      }
+    });
+  }
+
+  Widget _buildJoystickWithLabel(String label, Function(double, double) onUpdate, VoidCallback onEnd) {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Text(
-          label,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 13,
-            fontWeight: FontWeight.w600,
-            shadows: [Shadow(color: Colors.black87, blurRadius: 2, offset: Offset(1, 1))],
-          ),
-        ),
-        const SizedBox(height: 10),
         Container(
-          width: 160,
-          height: 160,
+          width: 160, height: 160,
           decoration: BoxDecoration(
-            color: Colors.black.withOpacity(0.5),
-            borderRadius: BorderRadius.circular(80),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withOpacity(0.3),
-                blurRadius: 8,
-                offset: const Offset(0, 3),
-              ),
-            ],
+            color: Colors.black.withOpacity(0.5), borderRadius: BorderRadius.circular(80),
+            boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 8, offset: const Offset(0, 3))],
           ),
           child: Joystick(
-            stick: AnimatedJoystickStick(x: xValue, y: yValue),
-            base: JoystickBase(mode: mode),
+            stick: AnimatedJoystickStick(x: lateral, y: throttle),
+            base: JoystickBase(),
             listener: (details) => onUpdate(details.x, details.y),
             onStickDragEnd: onEnd,
-          ),
-        ),
-        const SizedBox(height: 8),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          decoration: BoxDecoration(
-            color: Colors.black.withOpacity(0.7),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Text(
-            'X: ${xValue.toStringAsFixed(2)}, Y: ${yValue.toStringAsFixed(2)}',
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 11,
-              fontWeight: FontWeight.w500,
-            ),
           ),
         ),
       ],
     );
   }
 
-  // 動作按鈕
   Widget _buildActionButton(IconData icon, String label, Color color, VoidCallback? onTap) {
-    bool isDisabled = onTap == null;
     return ElevatedButton(
-      onPressed: onTap,
+      onPressed: isWebSocketConnected ? onTap : null,
       style: ElevatedButton.styleFrom(
-        backgroundColor: isDisabled ? Colors.grey.shade800 : color,
+        backgroundColor: isWebSocketConnected ? color : Colors.grey.shade800,
         foregroundColor: Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         elevation: 4,
-        shadowColor: Colors.black.withOpacity(0.5),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 22),
-          const SizedBox(height: 5),
-          Text(
-            label,
-            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
-          ),
-        ],
+        children: [Icon(icon, size: 22), const SizedBox(height: 5), Text(label, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))],
       ),
     );
   }
 }
 
-// 動畫搖桿
+// 菜單對話框組件
+class _MenuDialog extends StatefulWidget {
+  final String selectedMode;
+  final Function(String) onModeChanged;
+
+  const _MenuDialog({required this.selectedMode, required this.onModeChanged});
+
+  @override
+  State<_MenuDialog> createState() => _MenuDialogState();
+}
+
+class _MenuDialogState extends State<_MenuDialog> {
+  late String selectedMenu = '設定';
+  String currentSelectMode = '顯示加控制';
+
+  @override
+  void initState(){
+    super.initState();
+    currentSelectMode = widget.selectedMode;
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerRight,
+      child: Material(
+        color: Colors.black12.withOpacity(0.4),
+        child: Container(
+          width: 800,
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.95),
+          margin: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [BoxShadow(color: Colors.transparent, blurRadius: 10, offset: const Offset(-5, 0))],
+          ),
+          child: Stack(
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _buildMenuTabs(),
+                  Container(height: 400,width: 1, color: Colors.white.withOpacity(0.3)),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(12.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: _buildMenuContent(),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              Positioned(
+                top: 8, right: 8,
+                child: IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white, size: 25),
+                  onPressed: () => Navigator.pop(context),
+                  style: IconButton.styleFrom(backgroundColor: Colors.transparent, shape: const CircleBorder()),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMenuTabs() {
+    return SizedBox(
+      width: 140,
+      child: ListView(
+        scrollDirection: Axis.vertical,
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
+        children: [
+          _MenuItem(icon: Icons.settings, title: '設定', isSelected: selectedMenu == '設定', onTap: () => setState(() => selectedMenu = '設定')),
+          SizedBox(height: 10,),
+          _MenuItem(icon: Icons.info, title: '資訊', isSelected: selectedMenu == '資訊', onTap: () => setState(() => selectedMenu = '資訊')),
+          SizedBox(height: 10,),
+          _MenuItem(icon: Icons.help, title: '幫助', isSelected: selectedMenu == '幫助', onTap: () => setState(() => selectedMenu = '幫助')),
+          SizedBox(height: 10,),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _buildMenuContent() {
+    switch (selectedMenu) {
+      case '設定':
+        return [
+          const Text('設定', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          const ListTile(leading: Icon(Icons.adjust, color: Colors.white), title: Text('亮度調整', style: TextStyle(color: Colors.white))),
+          const ListTile(leading: Icon(Icons.vibration, color: Colors.white), title: Text('震動反饋', style: TextStyle(color: Colors.white))),
+          const Text('模式選擇', style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          // 添加模式說明
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('• 顯示加控制：完整功能模式', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                Text('• 僅顯示：只顯示錄影和雲台角度', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                Text('• 協同作業：只顯示搖桿控制', style: TextStyle(color: Colors.white70, fontSize: 12)),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8.0,
+            children: ['顯示加控制', '僅顯示', '協同作業'].map((mode) =>
+                _ModeOption(label: mode, isSelected: currentSelectMode == mode, onTap: (){
+                  setState(() {
+                    currentSelectMode = mode;
+                  });
+                  widget.onModeChanged(mode);
+                })
+            ).toList(),
+          ),
+        ];
+      case '資訊':
+        return [
+          const Text('應用資訊', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          const ListTile(leading: Icon(Icons.info_outline, color: Colors.white), title: Text('版本號: 2.4.6.8', style: TextStyle(color: Colors.white))),
+          const ListTile(leading: Icon(Icons.person, color: Colors.white), title: Text('開發者: 資二甲 裊裊 Team', style: TextStyle(color: Colors.white))),
+          ListTile(
+            leading: const Icon(Icons.email, color: Colors.white),
+            title: const Text('聯繫我們', style: TextStyle(color: Colors.white)),
+            onTap: () => _showInfoDialog('聯繫我們', '請發送郵件至: jerrysh0227@gmail.com'),
+          ),
+        ];
+      case '幫助':
+        return [
+          const Text('幫助與支援', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          const ListTile(leading: Icon(Icons.book, color: Colors.white), title: Text('使用手冊', style: TextStyle(color: Colors.white))),
+          ListTile(
+            leading: const Icon(Icons.question_answer, color: Colors.white),
+            title: const Text('常見問題', style: TextStyle(color: Colors.white)),
+            onTap: () => _showInfoDialog('常見問題', 'Q: 如何連線無人機?\nA: 請確保藍牙已啟用並配對設備。'),
+          ),
+          const ListTile(leading: Icon(Icons.support, color: Colors.white), title: Text('技術支援', style: TextStyle(color: Colors.white))),
+        ];
+      default:
+        return [];
+    }
+  }
+
+  void _showInfoDialog(String title, String content) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Text(content),
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('關閉'))],
+      ),
+    );
+  }
+}
+
+// 簡化的組件類別
+class _MenuItem extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  const _MenuItem({required this.icon, required this.title, required this.isSelected, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Column(
+          children: [
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, color: isSelected ? Colors.white : Colors.white70, size: 28),
+                const SizedBox(height: 4),
+                Text(title, style: TextStyle(color: isSelected ? Colors.white : Colors.white70, fontSize: 15, fontWeight: isSelected ? FontWeight.bold : FontWeight.w500)),
+              ],
+            ),
+            if (isSelected) Container(margin: const EdgeInsets.only(top: 4), height: 2, width: 45, color: Colors.white),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ModeOption extends StatelessWidget {
+  final String label;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  const _ModeOption({required this.label, required this.isSelected, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return ChoiceChip(
+      label: Text(
+          label,
+          style: TextStyle(
+              color: isSelected ? Colors.white : Colors.black45
+          )
+      ),
+      selected: isSelected,
+      selectedColor: Colors.black.withOpacity(0.6),
+      backgroundColor: Colors.white24,
+      onSelected: (bool selected) {
+        if (selected) {
+          onTap();
+        }
+      },
+    );
+  }
+}
+// 保持原有的複雜組件
 class AnimatedJoystickStick extends StatefulWidget {
-  final double x;
-  final double y;
+  final double x, y;
   const AnimatedJoystickStick({super.key, required this.x, required this.y});
   @override
   _AnimatedJoystickStickState createState() => _AnimatedJoystickStickState();
@@ -1078,9 +707,7 @@ class _AnimatedJoystickStickState extends State<AnimatedJoystickStick> with Sing
   void initState() {
     super.initState();
     _scaleController = AnimationController(duration: const Duration(milliseconds: 150), vsync: this);
-    _scaleAnimation = Tween<double>(begin: 1.0, end: 1.15).animate(
-      CurvedAnimation(parent: _scaleController, curve: Curves.easeInOut),
-    );
+    _scaleAnimation = Tween<double>(begin: 1.0, end: 1.15).animate(CurvedAnimation(parent: _scaleController, curve: Curves.easeInOut));
   }
 
   @override
@@ -1107,33 +734,36 @@ class _AnimatedJoystickStickState extends State<AnimatedJoystickStick> with Sing
         return Transform.scale(
           scale: _scaleAnimation.value,
           child: Container(
-            width: 55,
-            height: 55,
+            width: 55, height: 55,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              gradient: LinearGradient(
-                colors: [Colors.blueGrey.shade600, Colors.blueGrey.shade400],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.4),
-                  blurRadius: 6,
-                  offset: const Offset(2, 2),
-                ),
-              ],
+              gradient: LinearGradient(colors: [Colors.black12.withOpacity(0.5), Colors.blueGrey.shade400], begin: Alignment.topLeft, end: Alignment.bottomRight),
+              boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 6, offset: const Offset(2, 2))],
             ),
-            child: Center(
-              child: Icon(
-                Icons.control_camera_rounded,
-                color: Colors.white.withOpacity(0.8),
-                size: 24,
-              ),
-            ),
+            child: Center(child: Icon(Icons.control_camera_rounded, color: Colors.white.withOpacity(0.8), size: 24)),
           ),
         );
       },
+    );
+  }
+}
+
+class JoystickBase extends StatelessWidget {
+  const JoystickBase({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 200, height: 200,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: RadialGradient(colors: [Colors.blueGrey.shade800.withOpacity(0.5), Colors.black.withOpacity(0.6)], stops: const [0.7, 1.0]),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 10, offset: const Offset(0, 4)),
+          BoxShadow(color: Colors.grey.shade900.withOpacity(0.3), spreadRadius: -5.0, blurRadius: 10.0),
+        ],
+      ),
+      child: CustomPaint(painter: JoystickCrosshairPainter(), size: const Size(150, 150)),
     );
   }
 }
@@ -1154,45 +784,6 @@ class JoystickCrosshairPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
-// 搖桿底座
-class JoystickBase extends StatelessWidget {
-  final JoystickMode mode;
-  const JoystickBase({super.key, this.mode = JoystickMode.all});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 150,
-      height: 150,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        gradient: RadialGradient(
-          colors: [Colors.blueGrey.shade800.withOpacity(0.5), Colors.black.withOpacity(0.6)],
-          stops: const [0.7, 1.0],
-          center: Alignment.center,
-          radius: 0.9,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.4),
-            blurRadius: 10,
-            offset: const Offset(0, 4),
-          ),
-          BoxShadow(
-            color: Colors.blueGrey.shade900.withOpacity(0.9),
-            spreadRadius: -5.0,
-            blurRadius: 10.0,
-          ),
-        ],
-      ),
-      child: CustomPaint(
-        painter: JoystickCrosshairPainter(),
-        size: const Size(150, 150),
-      ),
-    );
-  }
 }
 
 // 錄影按鈕
@@ -1256,8 +847,8 @@ class _RecordButtonState extends State<RecordButton> with SingleTickerProviderSt
         widget.onTap();
       },
       child: Container(
-        width: 44,
-        height: 44,
+        width: 50,
+        height: 50,
         decoration: BoxDecoration(
           color: Colors.black.withOpacity(0.2),
           borderRadius: BorderRadius.circular(22),
@@ -1296,30 +887,6 @@ class _RecordButtonState extends State<RecordButton> with SingleTickerProviderSt
           ),
         ),
       ),
-    );
-  }
-}
-
-//設定彈窗
-class _ModeOption extends StatelessWidget {
-  final String label;
-  final bool isSelected;
-  final VoidCallback onTap;
-
-  const _ModeOption({
-    required this.label,
-    required this.isSelected,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return ChoiceChip(
-      label: Text(label, style: const TextStyle(color: Colors.black38)),
-      selected: isSelected,
-      selectedColor: Colors.blueAccent.withOpacity(0.6),
-      backgroundColor: Colors.white24,
-      onSelected: (_) => onTap(),
     );
   }
 }
