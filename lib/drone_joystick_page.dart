@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:ui';
 import 'package:drone/main.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -491,43 +492,118 @@ class _MenuDialogState extends State<_MenuDialog> {
     return Align(
       alignment: Alignment.centerRight,
       child: Material(
-        color: Colors.black12.withOpacity(0.4),
+        color: Colors.transparent,
         child: Container(
-          width: 800,
-          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.95),
+          width: 450,
+          constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(context).size.height * 0.95
+          ),
           margin: const EdgeInsets.all(20),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(20),
-            boxShadow: [BoxShadow(color: Colors.transparent, blurRadius: 10, offset: const Offset(-5, 0))],
+            // 使用漸層背景增加現代感
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                Colors.grey.withOpacity(0.95),
+                Colors.black12.withOpacity(0.85),
+              ],
+            ),
+            borderRadius: BorderRadius.circular(24),
+            // 多層陰影增加立體感
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.15),
+                offset: const Offset(0, 10),
+                blurRadius: 30,
+                spreadRadius: 0,
+              ),
+              BoxShadow(
+                color: Colors.black.withOpacity(0.1),
+                offset: const Offset(0, 1),
+                blurRadius: 5,
+                spreadRadius: 0,
+              ),
+            ],
+            // 增加細微邊框
+            border: Border.all(
+              color: Colors.grey.withOpacity(0.3),
+              width: 1,
+            ),
           ),
-          child: Stack(
-            children: [
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
+          // 增加背景模糊效果
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(24),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+              child: Stack(
                 children: [
-                  _buildMenuTabs(),
-                  Container(height: 400,width: 1, color: Colors.white.withOpacity(0.3)),
-                  Expanded(
-                    child: SingleChildScrollView(
-                      padding: const EdgeInsets.all(12.0),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: _buildMenuContent(),
+                  Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _buildMenuTabs(),
+                      // 現代化分隔線
+                      Container(
+                        height: 1,
+                        width: double.infinity,
+                        margin: const EdgeInsets.symmetric(horizontal: 20),
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [
+                              Colors.transparent,
+                              Colors.grey.withOpacity(0.3),
+                              Colors.transparent,
+                            ],
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.all(20.0),
+                          physics: const BouncingScrollPhysics(),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: _buildMenuContent(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  // 現代化關閉按鈕
+                  Positioned(
+                    top: 12,
+                    right: 12,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.05),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.2),
+                          width: 1,
+                        ),
+                      ),
+                      child: Material(
+                        color: Colors.transparent,
+                        borderRadius: BorderRadius.circular(12),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: () => Navigator.pop(context),
+                          child: Container(
+                            width: 40,
+                            height: 40,
+                            child: Icon(
+                              Icons.close_rounded,
+                              color: Colors.black.withOpacity(0.7),
+                              size: 20,
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                   ),
                 ],
               ),
-              Positioned(
-                top: 8, right: 8,
-                child: IconButton(
-                  icon: const Icon(Icons.close, color: Colors.white, size: 25),
-                  onPressed: () => Navigator.pop(context),
-                  style: IconButton.styleFrom(backgroundColor: Colors.transparent, shape: const CircleBorder()),
-                ),
-              ),
-            ],
+            ),
           ),
         ),
       ),
@@ -536,15 +612,15 @@ class _MenuDialogState extends State<_MenuDialog> {
 
   Widget _buildMenuTabs() {
     return SizedBox(
-      width: 140,
+      height: 75,
       child: ListView(
-        scrollDirection: Axis.vertical,
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         children: [
           _MenuItem(icon: Icons.settings, title: '設定', isSelected: selectedMenu == '設定', onTap: () => setState(() => selectedMenu = '設定')),
-          SizedBox(height: 10,),
+          SizedBox(width: 20,),
           _MenuItem(icon: Icons.info, title: '資訊', isSelected: selectedMenu == '資訊', onTap: () => setState(() => selectedMenu = '資訊')),
-          SizedBox(height: 10,),
+          SizedBox(width: 20,),
           _MenuItem(icon: Icons.help, title: '幫助', isSelected: selectedMenu == '幫助', onTap: () => setState(() => selectedMenu = '幫助')),
           SizedBox(height: 10,),
         ],
