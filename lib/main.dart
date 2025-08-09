@@ -6,14 +6,19 @@ import 'drone_joystick_page.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 沉浸模式
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+
+  // 日誌設定
   Logger.root.level = Level.ALL;
   Logger.root.onRecord.listen((record) {
     debugPrint('${record.level.name}: ${record.time}: ${record.message}');
   });
-  await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+
   runApp(const DroneJoystickApp());
 }
+
 
 class DroneJoystickApp extends StatelessWidget {
   const DroneJoystickApp({super.key});
@@ -97,31 +102,36 @@ class _HomeState extends State<Home> {
                         ),
                         tabs: [Tab(text: "我的裝置"), Tab(text: "未知裝置")],
                       ),
+                      SizedBox(height: 30),
                       Expanded(
                         child: TabBarView(
                           children: [
                             // Tab 1：我的裝置
                             GridView.builder(
                               gridDelegate:
-                                  SliverGridDelegateWithFixedCrossAxisCount(
-                                    crossAxisCount: 2, // 每行 2 個卡片
-                                    crossAxisSpacing: 8.0, // 水平間距
-                                    mainAxisSpacing: 8.0, // 垂直間距
-                                  ),
+                              SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: 2, // 每行 2 個卡片
+                                crossAxisSpacing: 8.0, // 水平間距
+                                mainAxisSpacing: 8.0, // 垂直間距
+                              ),
                               itemCount: 1, // 顯示 10 格
                               itemBuilder: (context, index) {
                                 return Card(
                                   shadowColor: Colors.black,
                                   elevation: 10,
-                                  color: Colors.white,
+                                  color: const Color.fromARGB(255, 65, 62, 62),
+                                  shape: RoundedRectangleBorder(
+                                    side: BorderSide(color: Colors.black, width: 2),
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
                                   child: ListTile(
                                     leading: Icon(
                                       Icons.airplanemode_active,
-                                      color: Colors.black,
+                                      color: Colors.white,
                                     ),
                                     title: Text(
                                       "風暴毀滅者",
-                                      style: TextStyle(color: Colors.black),
+                                      style: TextStyle(color: Colors.white),
                                     ),
                                     onTap: () {
                                       Navigator.push(

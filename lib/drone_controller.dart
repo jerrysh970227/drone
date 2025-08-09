@@ -6,7 +6,7 @@ import 'constants.dart';
 
 class DroneController {
   final Logger log = Logger('DroneController');
-  final Function(String, bool, [double?]) onStatusChanged;
+  final Function(String, bool, [double? angle, bool? led]) onStatusChanged;
   IOWebSocketChannel? _channel;
   Timer? _reconnectTimer;
   Timer? _controlTimer;
@@ -14,13 +14,18 @@ class DroneController {
   final int maxRetries = 5;
   bool _isWebSocketConnected = false;
   String connectionStatus = 'Disconnected';
+  double _lastThrottle = 0.0;
+  double _lastYaw = 0.0;
+  double _lastForward = 0.0;
+  double _lastLateral = 0.0;
+  double _lastSpeed = 0.0;
 
   DroneController({required this.onStatusChanged});
 
-  void _updateStatus(String status, bool connected, [double? angle]) {
+  void _updateStatus(String status, bool connected, [double? angle, bool? led]) {
     _isWebSocketConnected = connected;
     connectionStatus = status;
-    onStatusChanged(status, connected, angle);
+    onStatusChanged(status, connected, angle, led);
   }
 
   Future<void> connect() async {
@@ -48,11 +53,15 @@ class DroneController {
       _channel!.stream.listen(
             (data) {
           log.info('Data received: $data');
-          var response = jsonDecode(data);
-          if (response['status'] == 'received') {
-            _updateStatus('Connected', true, response['angle']?.toDouble());
-          } else if (response['status'] == 'error') {
-            _updateStatus('Error: ${response['message']}', true);
+          try {
+            var response = jsonDecode(data);
+            if (response['status'] == 'received' || response['status'] == 'ok') {
+              _updateStatus('Connected', true, response['angle']?.toDouble(), response['led']);
+            } else if (response['status'] == 'error') {
+              _updateStatus('Error: ${response['message']}', true);
+            }
+          } catch (e) {
+            log.severe('解析消息失敗: $e');
           }
         },
         onDone: () {
@@ -99,32 +108,75 @@ class DroneController {
     log.info('Sent command: $message');
   }
 
-  void sendServoControl(double angle) {
+  void sendLedCommand(String action) {
     if (!_isWebSocketConnected || _channel == null) {
-      log.warning('Cannot send servo control: WebSocket not connected');
+      log.warning('Cannot send LED command: WebSocket not connected');
       return;
     }
-    final message = jsonEncode({'type': 'servo_control', 'angle': angle});
+    final message = jsonEncode({'type': 'command', 'action': action});
     _channel!.sink.add(message);
-    log.info('Sent servo control: $message');
+    log.info('Sent LED command: $message');
+  }
+
+  void sendServoSpeed(double speed) {
+    if (!_isWebSocketConnected || _channel == null) {
+      log.warning('無法發送伺服速度：WebSocket未連線');
+      return;
+    }
+    if ((speed - _lastSpeed).abs() > 0.01) {
+      final message = jsonEncode({'type': 'servo_speed', 'speed': speed.clamp(-1.0, 1.0)});
+      _channel!.sink.add(message);
+      log.info('發送伺服速度：${(speed * 100).toStringAsFixed(1)}%');
+      _lastSpeed = speed;
+    }
+  }
+
+  void sendServoAngle(double angle) {
+    if (!_isWebSocketConnected || _channel == null) {
+      log.warning('Cannot send servo angle: WebSocket not connected');
+      return;
+    }
+    // Align with server protocol: use 'servo_control' and clamp to [-45, 90]
+    final message = jsonEncode({'type': 'servo_control', 'angle': angle.clamp(-45.0, 90.0)});
+    _channel!.sink.add(message);
+    log.info('Sent servo angle: ${angle.toStringAsFixed(1)}°');
+  }
+
+  void requestServoAngle() {
+    if (!_isWebSocketConnected || _channel == null) {
+      log.warning('Cannot request servo angle: WebSocket not connected');
+      return;
+    }
+    final message = jsonEncode({'type': 'request_angle'});
+    _channel!.sink.add(message);
+    log.info('Requested servo angle');
   }
 
   void startSendingControl(double throttle, double yaw, double forward, double lateral) {
     _controlTimer?.cancel();
-    _controlTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+    _controlTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) {
       if (!_isWebSocketConnected || _channel == null) {
         timer.cancel();
         return;
       }
-      final message = jsonEncode({
-        'type': 'control',
-        'throttle': throttle,
-        'yaw': yaw,
-        'forward': forward,
-        'lateral': lateral,
-      });
-      _channel!.sink.add(message);
-      // log.debug('Sent control: $message');
+      const threshold = 0.05;
+      if ((throttle - _lastThrottle).abs() > threshold ||
+          (yaw - _lastYaw).abs() > threshold ||
+          (forward - _lastForward).abs() > threshold ||
+          (lateral - _lastLateral).abs() > threshold) {
+        final message = jsonEncode({
+          'type': 'control',
+          'throttle': throttle.clamp(-1.0, 1.0),
+          'yaw': yaw.clamp(-1.0, 1.0),
+          'forward': forward.clamp(-1.0, 1.0),
+          'lateral': lateral.clamp(-1.0, 1.0),
+        });
+        _channel!.sink.add(message);
+        _lastThrottle = throttle;
+        _lastYaw = yaw;
+        _lastForward = forward;
+        _lastLateral = lateral;
+      }
     });
   }
 
