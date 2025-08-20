@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:logging/logging.dart';
 import 'package:web_socket_channel/io.dart';
-import 'constants.dart';
+import '../constants.dart';
 
 class DroneController {
   final Logger log = Logger('DroneController');

@@ -5,11 +5,12 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:logging/logging.dart';
-import 'drone_controller.dart';
-import 'constants.dart';
+import '../controllers/drone_controller.dart';
+import '../constants.dart';
 import 'Photo_mode_setting.dart';
 import 'drone_joystick_page.dart';
-import 'main.dart';
+import '../main.dart';
+import 'home.dart';
 
 class DroneDisplayOnlyPage extends StatefulWidget {
   const DroneDisplayOnlyPage({super.key});
