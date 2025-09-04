@@ -1,10 +1,16 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'package:http/http.dart' as http;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_joystick/flutter_joystick.dart';
+import 'package:flutter_map/flutter_map.dart' as FMap;
+import 'package:google_maps_flutter/google_maps_flutter.dart' as GMaps;
+import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart' as latLng;
 import 'package:logging/logging.dart';
 import 'drone_controller.dart';
 import 'constants.dart';
@@ -21,9 +27,11 @@ class DroneJoystickPage extends StatefulWidget {
 
 class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProviderStateMixin {
   bool _flashlightEnabled = false;
+  bool _gestureRecognitionEnabled = false;
   bool _aiRecognitionEnabled = false;
   bool _aiRescueEnabled = false;
   bool _ledEnabled = false;
+  bool _useSliderControl = false; // 控制伺服馬達方式（false: 按鈕控制, true: 滑桿）
   final Logger log = Logger('DroneJoystickPage');
   late final DroneController _controller;
   late AnimationController _pulseController;
@@ -34,6 +42,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
   double yaw = 0.0;
   double forward = 0.0;
   double lateral = 0.0;
+
   // 平滑後的控制值
   double _smoothedThrottle = 0.0;
   double _smoothedYaw = 0.0;
@@ -53,6 +62,19 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
   Timer? _controlDebounceTimer; // 控制用
   Timer? _anglePollTimer;
   DateTime? _lastServoUiUpdate;
+  latLng.LatLng? dronePosition;
+  latLng.LatLng? _phonePosition; // 手機位置
+  bool isFullScreen = false;
+  bool _isSatelliteView = false; // 衛星視圖切換
+  // 移除 _is3DMapEnabled 變數，3D模式永久啟用
+  bool _showApiKeyOverlay = true; // 控制API金鑰提示覆蓋層顯示
+  GMaps.GoogleMapController? _googleMapController; // Google Maps 控制器
+  // 保存當前地圖攝影機位置，避免切換模式時跳回默認位置
+  GMaps.CameraPosition? _currentCameraPosition;
+  bool _isMapInitialized = false; // 標記地圖是否已初始化
+  late AnimationController _fullScreenController;
+  late Animation<double> _fullScreenAnimation;
+  Timer? _locationUpdateTimer; // 定期更新位置
 
   @override
   void initState() {
@@ -61,6 +83,12 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
     ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      systemNavigationBarColor: Colors.transparent,
+      systemNavigationBarDividerColor: Colors.transparent,
+    ));
 
     _pulseController = AnimationController(
       duration: const Duration(seconds: 2),
@@ -71,26 +99,38 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
     );
     _pulseController.repeat(reverse: true);
 
+    _fullScreenController = AnimationController(
+      duration: const Duration(milliseconds: 300),
+      vsync: this,
+    );
+    _fullScreenAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _fullScreenController, curve: Curves.easeInOut),
+    );
+
     _controller = DroneController(
-      onStatusChanged: (status, connected, [angle, led]) {
+      onStatusChanged: (status, connected, [angle, led, gpsData]) {
         setState(() {
           isWebSocketConnected = connected;
           log.info('WebSocket 狀態: $status, 連線: $connected');
           if (angle != null && angle >= -45.0 && angle <= 90.0) {
             if (!_isDraggingServo) {
-              final now = DateTime.now();
-              if (_lastServoUiUpdate == null || now.difference(_lastServoUiUpdate!).inMilliseconds > 150) {
-                // 平滑更新顯示角度，避免抖動
-                final current = _servoAngle ?? 0.0;
-                final filtered = current + (angle - current) * 0.2; // 更平滑
-                _servoAngle = double.parse(filtered.toStringAsFixed(2));
-                _lastServoUiUpdate = now;
-              }
+              _servoAngle = double.parse(angle.toStringAsFixed(2));
+              _lastServoUiUpdate = DateTime.now();
+              log.info('伺服角度更新: ${_servoAngle!.toStringAsFixed(2)}°');
             }
           }
           if (led != null) {
             _ledEnabled = led;
             log.info('LED 狀態更新: $_ledEnabled');
+          }
+          // 處理 GPS 數據
+          if (gpsData != null && gpsData is Map<String, dynamic>) {
+            final lat = gpsData['lat'];
+            final lon = gpsData['lon'];
+            if (lat != null && lon != null) {
+              dronePosition = latLng.LatLng(lat.toDouble(), lon.toDouble());
+              log.info('無人機位置更新: $lat, $lon');
+            }
           }
         });
       },
@@ -103,6 +143,984 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
         _controller.requestServoAngle();
       }
     });
+    _getCurrentLocation();
+    
+    // 定期更新手機位置
+    _locationUpdateTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
+      _getCurrentLocation();
+    });
+  }
+
+  Future<void> _getCurrentLocation() async {
+    try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        log.warning('位置服務未啟用');
+        // 嘗試打開位置服務設置
+        bool opened = await Geolocator.openLocationSettings();
+        if (!opened) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('請在設置中啟用位置服務'),
+              duration: Duration(seconds: 3),
+            ),
+          );
+        }
+        return;
+      }
+
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          log.warning('位置權限被拒絕');
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('需要位置權限才能顯示手機位置'),
+              duration: Duration(seconds: 3),
+            ),
+          );
+          return;
+        }
+      }
+
+      if (permission == LocationPermission.deniedForever) {
+        log.warning('位置權限永久被拒絕');
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('位置權限已被永久拒絕，請在設置中手動開啟'),
+            duration: Duration(seconds: 5),
+          ),
+        );
+        return;
+      }
+
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 10),
+      );
+      setState(() {
+        _phonePosition = latLng.LatLng(position.latitude, position.longitude);
+      });
+      log.info('獲取手機位置成功: ${position.latitude}, ${position.longitude}');
+      
+      // 顯示成功提示
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('位置更新: ${position.latitude.toStringAsFixed(6)}, ${position.longitude.toStringAsFixed(6)}'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      log.severe('獲取位置失敗: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('獲取位置失敗: $e'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+  }
+
+  void _toggleFullScreen() {
+    setState(() {
+      isFullScreen = !isFullScreen;
+    });
+    if (isFullScreen) {
+      _fullScreenController.forward();
+    } else {
+      _fullScreenController.reverse();
+    }
+    log.info('全螢幕模式已切換為: $isFullScreen');
+  }
+
+  void _showFullScreenMap() {
+    // 設備檢測和日誌記錄
+    final screenSize = MediaQuery.of(context).size;
+    final isTablet = screenSize.shortestSide >= 600;
+    final devicePixelRatio = MediaQuery.of(context).devicePixelRatio;
+    
+    log.info('開始顯示全螢幕 3D 地圖 - 設備類型: ${isTablet ? "平板" : "手機"}, 螢幕尺寸: ${screenSize.width}x${screenSize.height}, 像素比: $devicePixelRatio');
+    
+    // 所有設備都優先嘗試 Google Maps 3D，失敗時平板使用 FlutterMap 降級
+    try {
+      showDialog(
+        context: context,
+        barrierDismissible: true,
+        builder: (BuildContext context) {
+          log.info('正在建立全螢幕 3D 地圖對話框 - 設備: ${isTablet ? "平板" : "手機"}');
+          return StatefulBuilder(
+            builder: (BuildContext dialogContext, StateSetter dialogSetState) {
+              return Dialog.fullscreen(
+                child: Scaffold(
+                  backgroundColor: Colors.black,
+                  appBar: AppBar(
+                    title: Text(
+                      '無人機地圖${isTablet ? " (平板 3D 模式)" : ""}', 
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: isTablet ? 20 : 16,
+                      )
+                    ),
+                    backgroundColor: Colors.black.withOpacity(0.8),
+                    iconTheme: const IconThemeData(color: Colors.white),
+                    actions: [
+                      // 移除 3D 模式切換按鈕，3D 永久啟用
+                      // 衛星視圖切換按鈕
+                      IconButton(
+                        icon: Icon(
+                          _isSatelliteView ? Icons.map : Icons.satellite,
+                          color: _isSatelliteView ? Colors.orange : Colors.white,
+                          size: isTablet ? 28 : 24,
+                        ),
+                        onPressed: () {
+                          // 儲存當前攝影機位置
+                          if (_googleMapController != null) {
+                            _googleMapController!.getVisibleRegion().then((bounds) {
+                              final center = GMaps.LatLng(
+                                (bounds.northeast.latitude + bounds.southwest.latitude) / 2,
+                                (bounds.northeast.longitude + bounds.southwest.longitude) / 2,
+                              );
+                              setState(() {
+                                _isSatelliteView = !_isSatelliteView;
+                                // 保持當前位置和視角（所有模式都使用 3D）
+                                _currentCameraPosition = GMaps.CameraPosition(
+                                  target: center,
+                                  zoom: _currentCameraPosition?.zoom ?? 16.0,
+                                  tilt: _currentCameraPosition?.tilt ?? (_isSatelliteView ? 60.0 : 45.0),
+                                  bearing: _currentCameraPosition?.bearing ?? 30.0,
+                                );
+                              });
+                              
+                              // 在當前對話框中更新地圖
+                              dialogSetState(() {
+                                // 觸發對話框內部重建
+                              });
+                              
+                              log.info('地圖視圖切換為: ${_isSatelliteView ? "衛星視圖" : "標準地圖"}，保持當前位置: ${center.latitude}, ${center.longitude}');
+                            });
+                          } else {
+                            setState(() {
+                              _isSatelliteView = !_isSatelliteView;
+                            });
+                            dialogSetState(() {});
+                            log.info('地圖視圖切換為: ${_isSatelliteView ? "衛星視圖" : "標準地圖"}（無控制器）');
+                          }
+                        },
+                        tooltip: _isSatelliteView ? '切換到標準地圖' : '切換到衛星視圖',
+                      ),
+                      IconButton(
+                        icon: Icon(Icons.my_location, size: isTablet ? 28 : 24),
+                        onPressed: () {
+                          log.info('重新獲取手機位置 - 設備: ${isTablet ? "平板" : "手機"}');
+                          _getCurrentLocation();
+                          // 更新 Google Maps 攝影機位置（所有模式都使用 3D）
+                          if (_googleMapController != null && _phonePosition != null) {
+                            _googleMapController!.animateCamera(
+                              GMaps.CameraUpdate.newCameraPosition(
+                                GMaps.CameraPosition(
+                                  target: GMaps.LatLng(_phonePosition!.latitude, _phonePosition!.longitude),
+                                  zoom: 16.0,
+                                  tilt: _isSatelliteView ? 60.0 : 45.0, // 所有模式都使用 3D
+                                  bearing: 30.0,
+                                ),
+                              ),
+                            );
+                          }
+                        },
+                        tooltip: '定位手機位置',
+                      ),
+                      // 平板專用：FlutterMap 降級按鈕
+                      if (isTablet)
+                        IconButton(
+                          icon: const Icon(Icons.layers, size: 28),
+                          onPressed: () {
+                            Navigator.of(context).pop();
+                            _showTabletOptimizedMap();
+                            log.info('平板切換到 FlutterMap 降級模式');
+                          },
+                          tooltip: '切換到備援地圖',
+                        ),
+                      IconButton(
+                        icon: Icon(Icons.close, size: isTablet ? 28 : 24),
+                        onPressed: () {
+                          log.info('關閉全螢幕地圖 - 設備: ${isTablet ? "平板" : "手機"}');
+                          Navigator.of(dialogContext).pop();
+                        },
+                        tooltip: '關閉',
+                      ),
+                    ],
+                  ),
+                  body: _buildFullScreenMapBody(dialogSetState),
+                ),
+              );
+            },
+          );
+        },
+      );
+      log.info('全螢幕 3D 地圖對話框已啟動 - 設備: ${isTablet ? "平板" : "手機"}');
+    } catch (e) {
+      log.severe('Google Maps 展示錯誤: $e - 設備: ${isTablet ? "平板" : "手機"}');
+      
+      // 平板設備的特殊處理邏輯 - 自動降級到 FlutterMap
+      if (isTablet) {
+        log.info('平板設備 Google Maps 失敗，自動切換到優化版 FlutterMap');
+        _showTabletOptimizedMap();
+      } else {
+        // 手機設備的簡單處理
+        _showFlutterMapFallback();
+      }
+    }
+  }
+
+  // 專為平板優化的地圖顯示方法
+  void _showTabletOptimizedMap() {
+    final screenSize = MediaQuery.of(context).size;
+    log.info('顯示平板優化地圖 - 螢幕尺寸: ${screenSize.width}x${screenSize.height}');
+    
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (BuildContext context) {
+        return Dialog.fullscreen(
+          child: Scaffold(
+            backgroundColor: Colors.black,
+            appBar: AppBar(
+              title: const Text(
+                '無人機地圖 (平板備援模式)', 
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w500,
+                )
+              ),
+              backgroundColor: Colors.black.withOpacity(0.8),
+              iconTheme: const IconThemeData(color: Colors.white),
+              actions: [
+                IconButton(
+                  icon: Icon(
+                    _isSatelliteView ? Icons.map : Icons.satellite,
+                    color: _isSatelliteView ? Colors.orange : Colors.white,
+                    size: 28,
+                  ),
+                  onPressed: () {
+                    setState(() {
+                      _isSatelliteView = !_isSatelliteView;
+                    });
+                    // 重新顯示地圖以應用新設置
+                    Navigator.of(context).pop();
+                    _showTabletOptimizedMap();
+                    log.info('平板地圖切換為: ${_isSatelliteView ? "衛星視圖" : "標準地圖"}');
+                  },
+                  tooltip: _isSatelliteView ? '切換到標準地圖' : '切換到衛星視圖',
+                ),
+                IconButton(
+                  icon: const Icon(Icons.view_in_ar, size: 28, color: Colors.cyan),
+                  onPressed: () {
+                    Navigator.of(context).pop();
+                    _showFullScreenMap(); // 嘗試使用 Google Maps 3D
+                    log.info('平板嘗試切換到 Google Maps 3D 模式');
+                  },
+                  tooltip: '嘗試 3D 模式 (Google Maps)',
+                ),
+                IconButton(
+                  icon: const Icon(Icons.my_location, size: 28),
+                  onPressed: () {
+                    _getCurrentLocation();
+                    log.info('平板設備重新獲取位置');
+                  },
+                  tooltip: '定位手機位置',
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 28),
+                  onPressed: () {
+                    Navigator.of(context).pop();
+                    log.info('關閉平板地圖');
+                  },
+                  tooltip: '關閉',
+                ),
+              ],
+            ),
+            body: _buildTabletFlutterMap(),
+          ),
+        );
+      },
+    );
+  }
+
+  // 為平板構建優化的 FlutterMap
+  Widget _buildTabletFlutterMap() {
+    log.info('構建平板專用 FlutterMap - 衛星模式: $_isSatelliteView');
+    
+    return FMap.FlutterMap(
+      options: FMap.MapOptions(
+        initialCenter: dronePosition ?? _phonePosition ?? const latLng.LatLng(25.0330, 121.5654), // 台北101附近
+        initialZoom: 16.0, // 適合的初始縮放級別
+        minZoom: 3.0,
+        maxZoom: 22.0,
+        interactionOptions: const FMap.InteractionOptions(
+          flags: FMap.InteractiveFlag.all,
+        ),
+      ),
+      children: [
+        FMap.TileLayer(
+          urlTemplate: _isSatelliteView 
+              ? 'https://mt{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}&hl=zh-TW' // Google 衛星圖
+              : 'https://mt{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}&hl=zh-TW', // Google 標準地圖
+          subdomains: const ['0', '1', '2', '3'],
+          userAgentPackageName: 'com.example.drone_app',
+        ),
+        // 標記層
+        if (dronePosition != null || _phonePosition != null)
+          FMap.MarkerLayer(
+            markers: [
+              // 手機位置標記（平板優化尺寸）
+              if (_phonePosition != null)
+                FMap.Marker(
+                  point: _phonePosition!,
+                  width: 50.0, // 平板使用較大的標記
+                  height: 50.0,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.blue.withOpacity(0.8),
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 2),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.3),
+                          blurRadius: 4,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: const Icon(
+                      Icons.tablet_android,
+                      color: Colors.white,
+                      size: 30,
+                    ),
+                  ),
+                ),
+              // 無人機位置標記（平板優化尺寸）
+              if (dronePosition != null)
+                FMap.Marker(
+                  point: dronePosition!,
+                  width: 55.0, // 平板使用較大的標記
+                  height: 55.0,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.red.withOpacity(0.8),
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 2),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.3),
+                          blurRadius: 4,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: const Icon(
+                      Icons.airplanemode_active,
+                      color: Colors.white,
+                      size: 35,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        // 平板專用的狀態顯示層
+        Positioned(
+          top: 20,
+          left: 20,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.7),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: Colors.white.withOpacity(0.2)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  _isSatelliteView ? Icons.satellite : Icons.map,
+                  color: _isSatelliteView ? Colors.orange : Colors.green,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  _isSatelliteView ? '衛星模式' : '標準地圖',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        // 平板備援模式提示訊息
+        Positioned(
+          bottom: 20,
+          left: 20,
+          child: Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.8),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.orange.withOpacity(0.5)),
+            ),
+            child: const Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.info_outline, color: Colors.orange, size: 16),
+                    SizedBox(width: 6),
+                    Text('平板備援模式', 
+                      style: TextStyle(color: Colors.orange, fontSize: 12, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+                SizedBox(height: 4),
+                Text('穩定的 2D 地圖顯示，無 3D 建築功能', 
+                  style: TextStyle(color: Colors.white70, fontSize: 11)),
+                SizedBox(height: 2),
+                Text('如需 3D 功能，請嘗試 Google Maps 模式', 
+                  style: TextStyle(color: Colors.white60, fontSize: 10)),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFullScreenMapBody([StateSetter? dialogSetState]) {
+    // 獲取螢幕資訊進行平板檢測
+    final screenSize = MediaQuery.of(context).size;
+    final isTablet = screenSize.shortestSide >= 600; // 平板檢測
+    final pixelRatio = MediaQuery.of(context).devicePixelRatio;
+    
+    log.info('設備資訊 - 螢幕尺寸: ${screenSize.width}x${screenSize.height}, 最短邊: ${screenSize.shortestSide}, 是否為平板: $isTablet, 像素比: $pixelRatio');
+    
+    // 當 API 金鑰無效或 Google Maps 無法使用時，使用 FlutterMap 作為備援
+    try {
+      return Stack(
+        children: [
+          GMaps.GoogleMap(
+            // 使用新的地圖類型選擇方法，確保 3D 衛星模式正確運作
+            mapType: _determineOptimalMapType(),
+            initialCameraPosition: _currentCameraPosition ?? GMaps.CameraPosition(
+              target: GMaps.LatLng(
+                dronePosition?.latitude ?? _phonePosition?.latitude ?? 25.0330, // 預設在台北101附近以測試3D效果
+                dronePosition?.longitude ?? _phonePosition?.longitude ?? 121.5654,
+              ),
+              // 所有模式都使用 3D，平板使用更高縮放以確保 3D 建築顯示
+              zoom: isTablet ? 18.0 : 16.0, // 平板使用更高縮放級別
+              tilt: _isSatelliteView ? 70.0 : (isTablet ? 60.0 : 45.0), // 平板使用更大 3D 傾斜角度
+              bearing: 45.0, // 更好的 3D 旋轉角度
+            ),
+            onMapCreated: (GMaps.GoogleMapController controller) {
+              _googleMapController = controller;
+              _isMapInitialized = true;
+              
+              // 獲取設備類型
+              final screenSize = MediaQuery.of(context).size;
+              final isTablet = screenSize.shortestSide >= 600;
+              
+              log.info('${isTablet ? "平板" : "手機"} Google Maps 控制器初始化 - 永久 3D 模式, 衛星模式: $_isSatelliteView, 地圖類型: ${_determineOptimalMapType()}');
+              
+              if (isTablet) {
+                // 平板專用：更積極的 3D 加載策略
+                log.info('平板設備啟動強化 3D 建築加載模式');
+                
+                // 第一次：立即強制設置
+                _force3DView(controller);
+                
+                // 第二次：1 秒後再次強化
+                Timer(const Duration(seconds: 1), () {
+                  if (mounted && _googleMapController != null) {
+                    _force3DView(_googleMapController!);
+                    log.info('平板 3D 建築第一次強化完成');
+                  }
+                });
+                
+                // 第三次：3 秒後最終強化
+                Timer(const Duration(seconds: 3), () {
+                  if (mounted && _googleMapController != null) {
+                    _force3DView(_googleMapController!);
+                    log.info('平板 3D 建築最終強化完成 - 確保 3D 顯示');
+                  }
+                });
+                
+                // 平板設備 5 秒後檢查地圖加載狀態
+                Timer(const Duration(seconds: 5), () {
+                  _checkMapLoadingAndFallback();
+                });
+              } else {
+                // 手機設備的標準邏輯
+                Timer(const Duration(seconds: 3), () {
+                  _checkMapLoadingAndFallback();
+                });
+                
+                // 關鍵：立即且多次強制設置 3D 視角（所有模式都啟用 3D）
+                // 第一次：500ms 後
+                Timer(const Duration(milliseconds: 500), () {
+                  if (mounted && controller != null) {
+                    _force3DView(controller);
+                  }
+                });
+                
+                // 第二次：2 秒後
+                Timer(const Duration(seconds: 2), () {
+                  if (mounted && controller != null) {
+                    _force3DView(controller);
+                  }
+                });
+              }
+              
+              // 記錄攝影機位置變化
+              controller.getVisibleRegion().then((bounds) {
+                final center = GMaps.LatLng(
+                  (bounds.northeast.latitude + bounds.southwest.latitude) / 2,
+                  (bounds.northeast.longitude + bounds.southwest.longitude) / 2,
+                );
+                _currentCameraPosition = GMaps.CameraPosition(
+                  target: center,
+                  zoom: _currentCameraPosition?.zoom ?? 16.0,
+                  tilt: _isSatelliteView ? 60.0 : 45.0,
+                  bearing: 30.0,
+                );
+              });
+            },
+            onCameraMove: (GMaps.CameraPosition position) {
+              // 即時更新攝影機位置，保持用戶瀏覽位置
+              _currentCameraPosition = position;
+            },
+            // 最佳化的 3D 設定組合
+            buildingsEnabled: true, // 啟用 3D 建築物
+            tiltGesturesEnabled: true,
+            rotateGesturesEnabled: true,
+            zoomGesturesEnabled: true,
+            scrollGesturesEnabled: true,
+            myLocationEnabled: true,
+            myLocationButtonEnabled: false,
+            compassEnabled: true,
+            mapToolbarEnabled: false,
+            // 3D 效果優化
+            indoorViewEnabled: true, // 室內 3D 效果
+            trafficEnabled: false, // 避免干擾 3D 視覺
+            liteModeEnabled: false, // 禁用簡化模式
+            // 標記點（為平板調整尺寸）
+            markers: {
+              // 手機位置標記
+              if (_phonePosition != null)
+                GMaps.Marker(
+                  markerId: const GMaps.MarkerId('phone_location'),
+                  position: GMaps.LatLng(_phonePosition!.latitude, _phonePosition!.longitude),
+                  icon: GMaps.BitmapDescriptor.defaultMarkerWithHue(GMaps.BitmapDescriptor.hueBlue),
+                  infoWindow: GMaps.InfoWindow(
+                    title: '手機位置',
+                    snippet: '您的當前位置 (${isTablet ? "平板" : "手機"}設備)',
+                  ),
+                ),
+              // 無人機位置標記
+              if (dronePosition != null)
+                GMaps.Marker(
+                  markerId: const GMaps.MarkerId('drone_location'),
+                  position: GMaps.LatLng(dronePosition!.latitude, dronePosition!.longitude),
+                  icon: GMaps.BitmapDescriptor.defaultMarkerWithHue(GMaps.BitmapDescriptor.hueRed),
+                  infoWindow: const GMaps.InfoWindow(
+                    title: '無人機位置',
+                    snippet: '無人機當前位置',
+                  ),
+                ),
+            },
+            // 地圖樣式（中文地名）
+            onTap: (GMaps.LatLng position) {
+              log.info('點擊地圖位置: ${position.latitude}, ${position.longitude} - 設備: ${isTablet ? "平板" : "手機"}');
+            },
+          ),
+          // Google Maps API 金鑰提示覆蓋層（為平板優化位置）
+          _buildApiKeyInfoOverlay(dialogSetState, isTablet),
+        ],
+      );
+    } catch (e) {
+      log.severe('Google Maps 初始化失敗: $e（設備: ${MediaQuery.of(context).size.shortestSide >= 600 ? "平板" : "手機"}），切換到 FlutterMap');
+      return _buildFlutterMapFallback();
+    }
+  }
+
+  Widget _buildApiKeyInfoOverlay([StateSetter? dialogSetState, bool isTablet = false]) {
+    log.info('試圖建立 API 金鑰覆蓋層，_showApiKeyOverlay = $_showApiKeyOverlay，設備類型: ${isTablet ? "平板" : "手機"}');
+    // 如果覆蓋層被關閉，則不顯示
+    if (!_showApiKeyOverlay) {
+      log.info('覆蓋層已關閉，返回空 widget');
+      return const SizedBox.shrink();
+    }
+    
+    log.info('顯示 API 金鑰覆蓋層');
+    // 為平板調整位置和尺寸
+    final overlayTop = isTablet ? 40.0 : 20.0;
+    final overlayHorizontal = isTablet ? 40.0 : 20.0;
+    
+    return Positioned(
+      top: overlayTop,
+      left: overlayHorizontal,
+      right: overlayHorizontal,
+      child: Container(
+        padding: EdgeInsets.all(isTablet ? 20 : 16),
+        decoration: BoxDecoration(
+          color: Colors.orange.withOpacity(0.9),
+          borderRadius: BorderRadius.circular(isTablet ? 16 : 12),
+          border: Border.all(color: Colors.orange.shade700, width: 2),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.3),
+              blurRadius: isTablet ? 12 : 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  Icons.warning_amber_rounded,
+                  color: Colors.orange.shade800,
+                  size: isTablet ? 28 : 24,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Google Maps 設定提示${isTablet ? " (平板模式)" : ""}',
+                    style: TextStyle(
+                      color: Colors.black87,
+                      fontSize: isTablet ? 18 : 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                GestureDetector(
+                  onTap: () {
+                    // 隐藏覆蓋層
+                    log.info('點擊關閉按鈕，當前 _showApiKeyOverlay = $_showApiKeyOverlay');
+                    
+                    // 使用主頁面的 setState 更新主狀態
+                    setState(() {
+                      _showApiKeyOverlay = false;
+                    });
+                    
+                    // 如果有 dialogSetState，也更新 Dialog 的狀態
+                    if (dialogSetState != null) {
+                      dialogSetState(() {
+                        // 觸發 Dialog 內部重建
+                      });
+                    }
+                    
+                    log.info('已設定 _showApiKeyOverlay = $_showApiKeyOverlay，關閉 API 金鑰提示覆蓋層');
+                  },
+                  child: Icon(
+                    Icons.close,
+                    color: Colors.orange.shade800,
+                    size: isTablet ? 24 : 20,
+                  ),
+                ),
+              ],
+            ),
+            SizedBox(height: isTablet ? 16 : 12),
+            Text(
+              '如果地圖顯示空白，請檢查：',
+              style: TextStyle(
+                color: Colors.black87,
+                fontSize: isTablet ? 16 : 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            SizedBox(height: isTablet ? 12 : 8),
+            _buildInfoStep('1. ', '在 AndroidManifest.xml 中設定有效的 Google Maps API 金鑰', isTablet),
+            _buildInfoStep('2. ', '確保已啟用 "Maps SDK for Android" API', isTablet),
+            _buildInfoStep('3. ', '網路連線正常', isTablet),
+            if (isTablet) _buildInfoStep('4. ', '平板設備可能需要更長的地圖加載時間', isTablet),
+            SizedBox(height: isTablet ? 16 : 12),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      Navigator.of(context).pop();
+                      _showFlutterMapFallback();
+                    },
+                    icon: Icon(Icons.map, size: isTablet ? 22 : 18),
+                    label: Text(
+                      '使用備援地圖',
+                      style: TextStyle(fontSize: isTablet ? 16 : 14),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue.shade700,
+                      foregroundColor: Colors.white,
+                      padding: EdgeInsets.symmetric(vertical: isTablet ? 12 : 8),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInfoStep(String number, String text, [bool isTablet = false]) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            number,
+            style: TextStyle(
+              color: Colors.orange.shade800,
+              fontSize: isTablet ? 15 : 13,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(
+                color: Colors.black87,
+                fontSize: isTablet ? 15 : 13,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _checkMapLoadingAndFallback() {
+    // 這個方法檢查 Google Maps 是否正確加載
+    final screenSize = MediaQuery.of(context).size;
+    final isTablet = screenSize.shortestSide >= 600;
+    
+    log.warning('檢查 Google Maps 加載狀態 - 設備: ${isTablet ? "平板" : "手機"}, 螢幕尺寸: ${screenSize.width}x${screenSize.height}');
+    
+    // 平板特殊處理：如果是平板且 Google Maps 無法正常顯示，切換到備援模式
+    if (isTablet && !_showApiKeyOverlay) {
+      log.info('平板設備檢測到可能的地圖加載問題，準備備援方案');
+      // 平板上更容易出現 Google Maps 加載問題，提供更好的用戶提示
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('平板設備檢測到地圖加載問題，建議使用備援地圖模式'),
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: '使用備援地圖',
+              onPressed: () {
+                Navigator.of(context).pop();
+                _showFlutterMapFallback();
+              },
+            ),
+          ),
+        );
+      }
+    }
+    
+    // 如果 API 金鑰無效，Google Maps 會顯示空白但控制器仍會初始化
+    log.warning('如果為空白則可能需要有效的 API 金鑰');
+  }
+
+  // 決定最佳地圖類型的方法（3D模式永久啟用）
+  GMaps.MapType _determineOptimalMapType() {
+    if (_isSatelliteView) {
+      // 衛星模式：使用 hybrid 以獲得 3D 衛星效果
+      log.info('使用 hybrid 地圖類型以支援 3D 衛星模式');
+      return GMaps.MapType.hybrid;
+    } else {
+      // 標準模式：使用 normal 但啟用 3D 建築
+      return GMaps.MapType.normal;
+    }
+  }
+
+  // 強制設置 3D 視角的方法（所有模式都使用 3D）
+  void _force3DView(GMaps.GoogleMapController controller) {
+    final target = GMaps.LatLng(
+      _currentCameraPosition?.target.latitude ?? 25.0330, // 台北101
+      _currentCameraPosition?.target.longitude ?? 121.5654,
+    );
+    
+    // 為所有模式設置 3D 參數，平板使用更高的縮放以確保 3D 建築顯示
+    final screenSize = MediaQuery.of(context).size;
+    final isTablet = screenSize.shortestSide >= 600;
+    final zoomLevel = isTablet ? 18.0 : (_currentCameraPosition?.zoom ?? 16.0); // 平板使用更高縮放
+    final tiltAngle = _isSatelliteView ? 70.0 : (isTablet ? 60.0 : 45.0); // 平板使用更大傾斜
+    
+    controller.animateCamera(
+      GMaps.CameraUpdate.newCameraPosition(
+        GMaps.CameraPosition(
+          target: target,
+          zoom: zoomLevel,
+          tilt: tiltAngle,
+          bearing: 45.0, // 平板使用更好的旋轉角度
+        ),
+      ),
+    );
+    
+    log.info('設置 3D 視角 - 縮放: $zoomLevel, 傾斜: $tiltAngle°, 模式: ${_isSatelliteView ? "衛星" : "標準"}, 設備: ${isTablet ? "平板" : "手機"}');
+    
+    // 更新當前攝影機位置
+    _currentCameraPosition = GMaps.CameraPosition(
+      target: target,
+      zoom: zoomLevel,
+      tilt: tiltAngle,
+      bearing: 45.0,
+    );
+  }
+
+  Widget _buildFlutterMapFallback() {
+    log.info('使用 FlutterMap 作為地圖備援');
+    return FMap.FlutterMap(
+      options: FMap.MapOptions(
+        initialCenter: dronePosition ?? _phonePosition ?? const latLng.LatLng(23.016725, 120.232065),
+        initialZoom: 16,
+        interactionOptions: const FMap.InteractionOptions(
+          flags: FMap.InteractiveFlag.all,
+        ),
+      ),
+      children: [
+        FMap.TileLayer(
+          urlTemplate: _isSatelliteView 
+              ? 'https://mt{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}&hl=zh-TW' // 衛星視圖
+              : 'https://mt{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}&hl=zh-TW', // 標準地圖
+          subdomains: const ['0', '1', '2', '3'],
+          userAgentPackageName: 'com.example.drone_app',
+        ),
+        if (dronePosition != null || _phonePosition != null)
+          FMap.MarkerLayer(
+            markers: [
+              // 手機位置標記  
+              if (_phonePosition != null)
+                FMap.Marker(
+                  point: _phonePosition!,
+                  width: 40,
+                  height: 40,
+                  child: const Icon(
+                    Icons.phone_android,
+                    color: Colors.blue,
+                    size: 35,
+                  ),
+                ),
+              // 無人機位置標記
+              if (dronePosition != null)
+                FMap.Marker(
+                  point: dronePosition!,
+                  width: 45,
+                  height: 45,
+                  child: const Icon(
+                    Icons.airplanemode_active,
+                    color: Colors.red,
+                    size: 40,
+                  ),
+                ),
+              ],
+            ),
+      ],
+    );
+  }
+
+  void _showFlutterMapFallback() {
+    log.info('顯示 FlutterMap 備援全螢幕地圖');
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (BuildContext context) {
+        return Dialog.fullscreen(
+          child: Scaffold(
+            backgroundColor: Colors.black,
+            appBar: AppBar(
+              title: const Text(
+                '無人機地圖 (備援模式)', 
+                style: TextStyle(color: Colors.white)
+              ),
+              backgroundColor: Colors.black.withOpacity(0.8),
+              iconTheme: const IconThemeData(color: Colors.white),
+              actions: [
+                IconButton(
+                  icon: Icon(
+                    _isSatelliteView ? Icons.map : Icons.satellite,
+                    color: _isSatelliteView ? Colors.orange : Colors.white,
+                  ),
+                  onPressed: () {
+                    setState(() {
+                      _isSatelliteView = !_isSatelliteView;
+                    });
+                    Navigator.of(context).pop();
+                    _showFlutterMapFallback();
+                  },
+                  tooltip: '切換地圖類型',
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: () => Navigator.of(context).pop(),
+                  tooltip: '關閉',
+                ),
+              ],
+            ),
+            body: _buildFlutterMapFallback(),
+          ),
+        );
+      },
+    );
+  }
+
+  void _updateServoAngle(double newAngle) {
+    _debounceTimer?.cancel();
+    final clampedAngle = newAngle.clamp(-45.0, 90.0);
+    setState(() {
+      _servoAngle = double.parse(clampedAngle.toStringAsFixed(2));
+    });
+    if (isWebSocketConnected) {
+      log.info('【伺服指令】即將送出角度: ${_servoAngle!.toStringAsFixed(2)}°');
+      _controller.sendServoAngle(_servoAngle!);
+      log.info('【伺服指令】已送出角度: ${_servoAngle!.toStringAsFixed(2)}°');
+    } else {
+      log.warning('WebSocket未連線，伺服指令未發送');
+    }
+  }
+
+  void _incrementServoAngle() {
+    final newAngle = (_servoAngle ?? 0.0) + 5.0;
+    _updateServoAngle(newAngle);
+    log.info('按鈕控制：伺服角度增加至 ${newAngle.toStringAsFixed(2)}°');
+  }
+
+  void _decrementServoAngle() {
+    final newAngle = (_servoAngle ?? 0.0) - 5.0;
+    _updateServoAngle(newAngle);
+    log.info('按鈕控制：伺服角度減少至 ${newAngle.toStringAsFixed(2)}°');
+  }
+
+  void _toggleLed() {
+    if (isWebSocketConnected) {
+      _controller.sendCommand(jsonEncode({
+        'type': 'led_control',
+        'action': _ledEnabled ? 'LED_OFF' : 'LED_ON',
+      }));
+      log.info('發送 LED 切換指令');
+    } else {
+      log.warning('WebSocket未連線，LED指令未發送');
+    }
   }
 
   void _connectToStream() async {
@@ -111,249 +1129,110 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
       isStreamLoaded = true;
       isCameraConnected = false;
     });
-    try {
-      _socket = await Socket.connect(
-        AppConfig.droneIP,
-        AppConfig.videoPort,
-        timeout: const Duration(seconds: 5),
-      );
-      log.info('成功連接到視訊串流：${AppConfig.droneIP}:${AppConfig.videoPort}');
-      _socketSubscription = _socket!.listen(
-            (data) {
-          try {
-            _buffer.addAll(data);
-            int start, end;
-            while ((start = _findJpegStart(_buffer)) != -1 && (end = _findJpegEnd(_buffer, start)) != -1) {
-              final frame = _buffer.sublist(start, end + 2);
-              _buffer = _buffer.sublist(end + 2);
-              setState(() {
-                _currentFrame = Uint8List.fromList(frame);
-                isCameraConnected = true;
-              });
+    int retries = 0;
+    const maxRetries = 5;
+    while (retries < maxRetries && mounted) {
+      try {
+        _socket = await Socket.connect(
+          AppConfig.droneIP,
+          AppConfig.videoPort,
+          timeout: const Duration(seconds: 15),
+        );
+        log.info('成功連接到視訊串流：${AppConfig.droneIP}:${AppConfig.videoPort}');
+        _socketSubscription = _socket!.listen(
+              (data) {
+            try {
+              _buffer.addAll(data);
+              int start, end;
+              while ((start = _findJpegStart(_buffer)) != -1 &&
+                  (end = _findJpegEnd(_buffer, start)) != -1) {
+                final frame = _buffer.sublist(start, end + 2);
+                _buffer = _buffer.sublist(end + 2);
+                setState(() {
+                  _currentFrame = Uint8List.fromList(frame);
+                  isCameraConnected = true;
+                });
+              }
+              if (_buffer.length > 500000) {
+                _buffer = _buffer.sublist(_buffer.length - 250000);
+                log.warning('緩衝區過大，已裁剪至 ${_buffer.length} 位元組');
+              }
+            } catch (e) {
+              log.severe('處理串流數據時出錯：$e');
             }
-            if (_buffer.length > 500000) {
-              _buffer = _buffer.sublist(_buffer.length - 250000);
-              log.warning('緩衝區過大，已裁剪至 ${_buffer.length} 位元組');
-            }
-          } catch (e) {
-            log.severe('處理串流數據時出錯：$e');
-          }
-        },
-        onError: (error) {
-          log.severe('串流錯誤：$error');
-          setState(() {
-            isCameraConnected = false;
-            isStreamLoaded = false;
-          });
-          _disconnectFromStream();
-          _scheduleStreamReconnect();
-        },
-        onDone: () {
-          log.warning('串流已關閉');
-          setState(() {
-            isCameraConnected = false;
-            isStreamLoaded = false;
-          });
-          _disconnectFromStream();
-          _scheduleStreamReconnect();
-        },
-        cancelOnError: true,
-      );
-    } catch (e) {
-      setState(() {
-        isStreamLoaded = false;
-        isCameraConnected = false;
-      });
-      log.severe('連線失敗：$e');
-      _scheduleStreamReconnect();
+          },
+          onError: (error) {
+            log.severe('串流錯誤：$error');
+            setState(() {
+              isCameraConnected = false;
+              isStreamLoaded = false;
+            });
+            _disconnectFromStream();
+            _scheduleStreamReconnect();
+          },
+          onDone: () {
+            log.warning('串流已關閉');
+            setState(() {
+              isCameraConnected = false;
+              isStreamLoaded = false;
+            });
+            _disconnectFromStream();
+            _scheduleStreamReconnect();
+          },
+        );
+        return;
+      } catch (e) {
+        retries++;
+        log.severe('連線失敗（嘗試 $retries/$maxRetries）：$e');
+        if (retries < maxRetries) {
+          await Future.delayed(const Duration(seconds: 2));
+        }
+      }
     }
+    setState(() {
+      isCameraConnected = false;
+      isStreamLoaded = false;
+    });
+    log.severe('視訊串流連線失敗，已達到最大重試次數');
+  }
+
+  void _disconnectFromStream() {
+    _socketSubscription?.cancel();
+    _socketSubscription = null;
+    _socket?.close();
+    _socket = null;
+    setState(() {
+      isCameraConnected = false;
+      isStreamLoaded = false;
+    });
+    log.info('已斷開視訊串流連線');
   }
 
   void _scheduleStreamReconnect() {
-    Timer(const Duration(seconds: 5), () {
-      if (!isStreamLoaded) {
+    Timer(const Duration(seconds: 2), () {
+      if (mounted && !isStreamLoaded) {
         log.info('嘗試重新連線到視訊串流...');
         _connectToStream();
       }
     });
   }
 
-  void _disconnectFromStream() {
-    _socketSubscription?.cancel();
-    _socket?.close();
-    _socket = null;
-    _socketSubscription = null;
-    _buffer.clear();
-    setState(() {
-      isStreamLoaded = false;
-      isCameraConnected = false;
-      _currentFrame = null;
-    });
-  }
-
-  int _findJpegStart(List<int> data) {
-    for (int i = 0; i < data.length - 1; i++) {
-      if (data[i] == 0xFF && data[i + 1] == 0xD8) return i;
+  int _findJpegStart(List<int> buffer) {
+    for (int i = 0; i < buffer.length - 1; i++) {
+      if (buffer[i] == 0xFF && buffer[i + 1] == 0xD8) {
+        return i;
+      }
     }
     return -1;
   }
 
-  int _findJpegEnd(List<int> data, int start) {
-    for (int i = start; i < data.length - 1; i++) {
-      if (data[i] == 0xFF && data[i + 1] == 0xD9) return i;
+  int _findJpegEnd(List<int> buffer, int start) {
+    for (int i = start; i < buffer.length - 1; i++) {
+      if (buffer[i] == 0xFF && buffer[i + 1] == 0xD9) {
+        return i;
+      }
     }
     return -1;
-  }
-
-  void startRecording() async {
-    try {
-      final socket = await Socket.connect(AppConfig.droneIP, 12345, timeout: const Duration(seconds: 5));
-      socket.write('start_recording');
-      await socket.flush();
-      socket.listen(
-            (data) {
-          log.info('錄影回應: ${String.fromCharCodes(data)}');
-          socket.close();
-        },
-        onDone: () {
-          socket.destroy();
-        },
-        onError: (e) {
-          log.severe('錄影 socket 錯誤: $e');
-        },
-      );
-      setState(() {
-        isRecording = true;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('開始錄影')),
-      );
-    } catch (e) {
-      log.severe('無法開始錄影: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('錄影失敗: $e')),
-      );
-    }
-  }
-
-  void stopRecording() async {
-    try {
-      final socket = await Socket.connect(AppConfig.droneIP, 12345, timeout: const Duration(seconds: 5));
-      socket.write('stop_recording');
-      await socket.flush();
-      socket.listen(
-            (data) {
-          log.info('錄影回應: ${String.fromCharCodes(data)}');
-          socket.close();
-        },
-        onDone: () {
-          socket.destroy();
-        },
-        onError: (e) {
-          log.severe('錄影 socket 錯誤: $e');
-        },
-      );
-      setState(() {
-        isRecording = false;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('停止錄影')),
-      );
-    } catch (e) {
-      log.severe('無法停止錄影: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('停止錄影失敗: $e')),
-      );
-    }
-  }
-
-  double _applyDeadzone(double v, {double dz = 0.06}) {
-    if (v.abs() < dz) return 0.0;
-    // 重新映射到 0..1 區間，避免穿越死區產生跳變
-    final sign = v.isNegative ? -1.0 : 1.0;
-    final mag = ((v.abs() - dz) / (1 - dz)).clamp(0.0, 1.0);
-    return sign * mag;
-  }
-
-  double _applyExpo(double v, {double expo = 0.3}) {
-    // expo > 0 時中心更柔；曲線: v*(1-expo) + v^3*expo
-    return v * (1 - expo) + v * v * v * expo;
-  }
-
-  double _lerp(double a, double b, double t) => a + (b - a) * t;
-
-  void _updateControlValues(JoystickMode mode, double x, double y) {
-    // 控制節流與平滑與伺服分離
-    _controlDebounceTimer?.cancel();
-    _controlDebounceTimer = Timer(const Duration(milliseconds: 25), () {
-      setState(() {
-        // 原始輸入（y 軸向上為正，故取 -y）
-        double inX = x;
-        double inY = -y;
-
-        // 死區
-        inX = _applyDeadzone(inX);
-        inY = _applyDeadzone(inY);
-
-        // expo
-        inX = _applyExpo(inX, expo: 0.35);
-        inY = _applyExpo(inY, expo: 0.35);
-
-        if (mode == JoystickMode.all) {
-          // 左搖桿：油門/偏航
-          throttle = inY;
-          yaw = inX;
-        } else {
-          // 右搖桿：前進/橫移
-          forward = inY;
-          lateral = inX;
-        }
-
-        // 一階低通平滑輸出，平衡延遲與穩定
-        const smoothing = 0.25; // 0..1 越大越跟手
-        _smoothedThrottle = _lerp(_smoothedThrottle, throttle, smoothing);
-        _smoothedYaw      = _lerp(_smoothedYaw,      yaw,      smoothing);
-        _smoothedForward  = _lerp(_smoothedForward,  forward,  smoothing);
-        _smoothedLateral  = _lerp(_smoothedLateral,  lateral,  smoothing);
-
-        if (isWebSocketConnected) {
-          _controller.startSendingControl(
-            _smoothedThrottle,
-            _smoothedYaw,
-            _smoothedForward,
-            _smoothedLateral,
-          );
-        } else {
-          _controller.stopSendingControl();
-        }
-      });
-    });
-  }
-
-  void _updateServoAngle(double newAngle) {
-    _debounceTimer?.cancel();
-    _debounceTimer = Timer(const Duration(milliseconds: 60), () {
-      setState(() {
-        final clampedAngle = (newAngle).clamp(-45.0, 90.0);
-        // 放寬門檻 0.5°，同時不四捨五入
-        if ((clampedAngle - (_servoAngle ?? 0.0)).abs() > 0.5) {
-          _servoAngle = clampedAngle;
-          if (isWebSocketConnected) {
-            _controller.sendServoAngle(_servoAngle!);
-            log.info('更新伺服角度：${_servoAngle!.toStringAsFixed(1)}°');
-          }
-        }
-      });
-    });
-  }
-
-  void _toggleLed() {
-    if (isWebSocketConnected) {
-      _controller.sendLedCommand('LED_TOGGLE');
-      log.info('發送 LED 切換指令');
-    } else {
-      log.warning('WebSocket未連線，LED指令未發送');
-    }
   }
 
   void _showMenuDialog() {
@@ -550,6 +1429,21 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
         trailing: _buildLedButton(),
       ),
       ListTile(
+        leading: const Icon(Icons.waving_hand, color: Colors.white),
+        title: const Text('手勢辨識', style: TextStyle(color: Colors.white)),
+        trailing: Switch(
+          value: _gestureRecognitionEnabled,
+          onChanged: (bool value) {
+            innerSetState(() {
+              _gestureRecognitionEnabled = value;
+            });
+            setState(() {
+              _gestureRecognitionEnabled = value;
+            });
+          },
+        ),
+      ),
+      ListTile(
         leading: const Icon(Icons.photo_camera, color: Colors.white),
         title: const Text('AI 辨識', style: TextStyle(color: Colors.white)),
         trailing: Switch(
@@ -575,6 +1469,25 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
             });
             setState(() {
               _aiRescueEnabled = value;
+            });
+          },
+        ),
+      ),
+      ListTile(
+        leading: const Icon(Icons.settings, color: Colors.white),
+        title: Text(
+          '伺服控制方式: ${_useSliderControl ? '滑桿' : '按鈕'}',
+          style: const TextStyle(color: Colors.white),
+        ),
+        trailing: Switch(
+          value: _useSliderControl,
+          onChanged: (bool value) {
+            innerSetState(() {
+              _useSliderControl = value;
+            });
+            setState(() {
+              _useSliderControl = value;
+              log.info('伺服控制方式切換為: ${_useSliderControl ? '滑桿' : '按鈕'}');
             });
           },
         ),
@@ -771,6 +1684,10 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
             const SizedBox(width: 8),
             _buildLedButton(),
             const Spacer(),
+            Text(
+              '伺服: ${_servoAngle?.toStringAsFixed(1) ?? 0.0}°',
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
             const SizedBox(width: 8),
             IconButton(
               onPressed: _showMenuDialog,
@@ -826,119 +1743,252 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
   }
 
   Widget _buildLedButton() {
-    Color activeColor = Colors.yellow.shade600;
-    Color inactiveColor = Colors.grey.shade600;
-    return Tooltip(
-      message: 'LED 控制',
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: _toggleLed,
-          borderRadius: BorderRadius.circular(12),
-          child: Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: _ledEnabled ? activeColor.withOpacity(0.25) : inactiveColor.withOpacity(0.25),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(
-                color: _ledEnabled ? activeColor.withOpacity(0.5) : inactiveColor.withOpacity(0.5),
-                width: 1.5,
+    return _buildConnectionButton(
+      icon: _ledEnabled ? Icons.lightbulb : Icons.lightbulb_outline,
+      isConnected: _ledEnabled,
+      onPressed: _toggleLed,
+      tooltip: 'LED控制',
+    );
+  }
+
+  Widget _buildServoSlider1() {
+    if (_useSliderControl) {
+      return Positioned(
+        left: 20,
+        top: 110,
+        child: Container(
+          height: 250,
+          width: 80,
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.6),
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.4),
+                blurRadius: 8,
+                offset: const Offset(0, 3),
               ),
-            ),
-            child: AnimatedBuilder(
-              animation: _pulseController,
-              builder: (context, child) => Transform.scale(
-                scale: _ledEnabled ? _pulseAnimation.value : 1.0,
-                child: Icon(
-                  Icons.lightbulb,
-                  color: _ledEnabled ? activeColor : inactiveColor,
-                  size: 22,
+            ],
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(top: 16.0),
+                child: Text(
+                  '雲台\n角度',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                    height: 1.2,
+                  ),
+                  textAlign: TextAlign.center,
                 ),
               ),
-            ),
+              const SizedBox(height: 16),
+              Expanded(
+                child: GestureDetector(
+                  onVerticalDragStart: (details) {
+                    setState(() {
+                      _isDraggingServo = true;
+                      log.info('開始拖拽伺服控制（滑桿）');
+                    });
+                  },
+                  onVerticalDragUpdate: (details) {
+                    final double maxDragDistance = 150.0;
+                    final double dragPosition = details.localPosition.dy;
+                    final double normalizedPosition = 1 - (dragPosition / maxDragDistance);
+                    final double newAngle = (normalizedPosition * 135 - 45).clamp(-45.0, 90.0);
+                    _updateServoAngle(newAngle);
+                  },
+                  onVerticalDragEnd: (details) {
+                    setState(() {
+                      _isDraggingServo = false;
+                      log.info('結束拖拽伺服控制（滑桿）');
+                    });
+                  },
+                  child: Container(
+                    alignment: Alignment.center,
+                    child: CustomPaint(
+                      size: const Size(80, 200),
+                      painter: ServoTrackPainter(servoAngle: _servoAngle ?? 0.0, isDragging: _isDraggingServo),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.8),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  '角度: ${_servoAngle?.toStringAsFixed(1) ?? 0.0}°',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
-      ),
-    );
-  }
-
-  Widget _buildServoSlider() {
-    final screenHeight = MediaQuery.of(context).size.height;
-    final sliderHeight = screenHeight * 0.55;
-    return Positioned(
-      left: 20,
-      top: (screenHeight - sliderHeight) / 2,
-      child: Container(
-        height: sliderHeight,
-        width: 80,
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.6),
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.4),
-              blurRadius: 8,
-              offset: const Offset(0, 3),
+      );
+    } else {
+      // Touch-to-appear servo control
+      return Stack(
+        children: [
+          // Invisible gesture detector covering the entire screen
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onPanStart: (details) {
+                if (!isWebSocketConnected) return;
+                setState(() {
+                  _isDraggingServo = true;
+                });
+                log.info('開始拖拽伺服控制');
+              },
+              onPanUpdate: (details) {
+                if (!isWebSocketConnected || !_isDraggingServo) return;
+                setState(() {
+                  double sensitivity = 0.5;
+                  _servoAngle = (_servoAngle ?? 0.0) - details.delta.dy * sensitivity;
+                  _servoAngle = _servoAngle!.clamp(-45.0, 90.0);
+                });
+                _updateServoAngle(_servoAngle!);
+              },
+              onPanEnd: (details) {
+                setState(() {
+                  _isDraggingServo = false;
+                });
+                log.info('結束拖拽伺服控制');
+              },
+              onTap: () {
+                if (!isWebSocketConnected) return;
+                setState(() {
+                  _servoAngle = 0.0;
+                });
+                _updateServoAngle(0.0);
+                log.info('伺服角度歸零');
+              },
             ),
-          ],
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            if (!isWebSocketConnected)
-              const Padding(
-                padding: EdgeInsets.only(bottom: 8.0),
-                child: Text(
-                  '伺服未連線',
-                  style: TextStyle(color: Colors.redAccent, fontSize: 12),
+          ),
+          // Servo control interface - only show when dragging
+          if (_isDraggingServo)
+            Center(
+              child: AnimatedOpacity(
+                opacity: _isDraggingServo ? 1.0 : 0.0,
+                duration: const Duration(milliseconds: 200),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.8),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Colors.blue.withOpacity(0.7),
+                      width: 2,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.5),
+                        blurRadius: 10,
+                        offset: const Offset(0, 3),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.keyboard_arrow_up,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                          Text(
+                            '向上',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 10,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(width: 20),
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            '雲台角度',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
+                          ),
+                          Text(
+                            '${_servoAngle?.toStringAsFixed(1)}°',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 24,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(width: 20),
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.keyboard_arrow_down,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                          Text(
+                            '向下',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 10,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            Expanded(
-              child: RotatedBox(
-                quarterTurns: 3,
-                child: Slider(
-                  value: _servoAngle ?? 0.0,
-                  min: -45.0,
-                  max: 90.0,
-                  divisions: null,
-                  label: '${_servoAngle?.toStringAsFixed(1)}°',
-                  onChanged: isWebSocketConnected
-                      ? (value) {
-                          _updateServoAngle(value);
-                          setState(() {
-                            _isDraggingServo = true;
-                          });
-                        }
-                      : null,
-                  onChangeEnd: isWebSocketConnected
-                      ? (value) {
-                          setState(() {
-                            _isDraggingServo = false;
-                          });
-                          _controller.sendServoAngle((value).clamp(-45.0, 90.0));
-                        }
-                      : null,
-                ),
-              ),
             ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.8),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Text(
-                '角度: ${_servoAngle?.toStringAsFixed(1) ?? 0.0}°',
-                style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+        ],
+      );
+    }
   }
 
-  // 恢復為角度控制，不需要速度等級對應
+  void _updateControlValues(JoystickMode mode, double x, double y) {
+    setState(() {
+      if (mode == JoystickMode.all) {
+        if (x.abs() > 0.1 || y.abs() > 0.1) {
+          _smoothedYaw = _smoothedYaw + (x - _smoothedYaw) * 0.3;
+          yaw = _smoothedYaw.clamp(-1.0, 1.0);
+          _smoothedThrottle = _smoothedThrottle + (y - _smoothedThrottle) * 0.3;
+          throttle = _smoothedThrottle.clamp(-1.0, 1.0);
+        } else {
+          yaw = 0.0;
+          _smoothedYaw = 0.0;
+          throttle = 0.0;
+          _smoothedThrottle = 0.0;
+        }
+      }
+      if (isWebSocketConnected) {
+        _controller.startSendingControl(throttle, yaw, forward, lateral);
+      }
+    });
+  }
 
   Widget _buildBottomControlArea() {
     return Positioned(
@@ -952,15 +2002,15 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
           _buildJoystickWithLabel(
             label: '油門/偏航',
             mode: JoystickMode.all,
-            onUpdate: (x, y) => _updateControlValues(JoystickMode.all, x, y),
+            onUpdate: (x, y) => _updateControlValues(JoystickMode.all, x, -y),
             onEnd: () {
               setState(() {
-                throttle = yaw = 0;
+                yaw = 0.0;
+                _smoothedYaw = 0.0;
+                throttle = 0.0;
+                _smoothedThrottle = 0.0;
                 if (isWebSocketConnected) {
-                  // 平滑回中，避免瞬間跳變
-                  _smoothedThrottle = _lerp(_smoothedThrottle, 0, 0.6);
-                  _smoothedYaw = _lerp(_smoothedYaw, 0, 0.6);
-                  _controller.startSendingControl(_smoothedThrottle, _smoothedYaw, _smoothedForward, _smoothedLateral);
+                  _controller.startSendingControl(throttle, yaw, forward, lateral);
                 }
               });
             },
@@ -975,14 +2025,20 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
                     Icons.flight_takeoff_rounded,
                     '啟動',
                     isWebSocketConnected ? Colors.greenAccent.shade700 : Colors.grey.shade700,
-                    isWebSocketConnected ? () => _controller.sendCommand('ARM') : null,
+                    isWebSocketConnected ? () => _controller.sendCommand(jsonEncode({
+                      'type': 'arm',
+                      'arm': true,
+                    })) : null,
                   ),
                   const SizedBox(width: 10),
                   _buildActionButton(
                     Icons.flight_land_rounded,
                     '解除',
                     isWebSocketConnected ? Colors.redAccent.shade400 : Colors.grey.shade700,
-                    isWebSocketConnected ? () => _controller.sendCommand('DISARM') : null,
+                    isWebSocketConnected ? () => _controller.sendCommand(jsonEncode({
+                      'type': 'arm',
+                      'arm': false,
+                    })) : null,
                   ),
                 ],
               ),
@@ -992,14 +2048,26 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
           _buildJoystickWithLabel(
             label: '前進/橫移',
             mode: JoystickMode.all,
-            onUpdate: (x, y) => _updateControlValues(JoystickMode.all, x, y),
+            onUpdate: (x, y) => setState(() {
+              if (x.abs() > 0.1 || y.abs() > 0.1) {
+                _smoothedForward = _smoothedForward + (y - _smoothedForward) * 0.3;
+                _smoothedLateral = _smoothedLateral + (x - _smoothedLateral) * 0.3;
+                forward = _smoothedForward.clamp(-1.0, 1.0);
+                lateral = _smoothedLateral.clamp(-1.0, 1.0);
+              } else {
+                forward = lateral = 0;
+                _smoothedForward = _smoothedLateral = 0.0;
+              }
+              if (isWebSocketConnected) {
+                _controller.startSendingControl(throttle, yaw, forward, lateral);
+              }
+            }),
             onEnd: () {
               setState(() {
                 forward = lateral = 0;
+                _smoothedForward = _smoothedLateral = 0.0;
                 if (isWebSocketConnected) {
-                  _smoothedForward = _lerp(_smoothedForward, 0, 0.6);
-                  _smoothedLateral = _lerp(_smoothedLateral, 0, 0.6);
-                  _controller.startSendingControl(_smoothedThrottle, _smoothedYaw, _smoothedForward, _smoothedLateral);
+                  _controller.startSendingControl(throttle, yaw, 0, 0);
                 }
               });
             },
@@ -1052,6 +2120,22 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
             onStickDragEnd: onEnd,
           ),
         ),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.7),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Text(
+            'X: ${xValue.toStringAsFixed(2)}, Y: ${yValue.toStringAsFixed(2)}',
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -1093,12 +2177,40 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
     );
   }
 
+  void startRecording() {
+    setState(() {
+      isRecording = true;
+    });
+    log.info('開始錄影');
+  }
+
+  void stopRecording() {
+    setState(() {
+      isRecording = false;
+    });
+    log.info('停止錄影');
+  }
+
+  void takePhoto() async {
+    if (_currentFrame == null) {
+      log.warning('無法拍照：無當前畫面');
+      return;
+    }
+    try {
+      log.info('拍照成功');
+    } catch (e) {
+      log.severe('拍照失敗：$e');
+    }
+  }
+
   @override
   void dispose() {
     _debounceTimer?.cancel();
     _controlDebounceTimer?.cancel();
     _anglePollTimer?.cancel();
+    _locationUpdateTimer?.cancel(); // 清理位置更新計時器
     _pulseController.dispose();
+    _fullScreenController.dispose();
     _controller.dispose();
     _disconnectFromStream();
     SystemChrome.setPreferredOrientations([
@@ -1107,6 +2219,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
     ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: SystemUiOverlay.values);
     super.dispose();
   }
 
@@ -1117,51 +2230,205 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
         child: Stack(
           fit: StackFit.expand,
           children: [
-            _currentFrame != null
-                ? Transform.rotate(
-              angle: math.pi,
-              child: Image.memory(
-                _currentFrame!,
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
-                errorBuilder: (context, error, stackTrace) => Container(
+            GestureDetector(
+              onTap: _toggleFullScreen,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 300),
+                decoration: BoxDecoration(
                   color: Colors.black,
-                  child: const Center(
-                    child: Text(
-                      '視訊解碼錯誤',
-                      style: TextStyle(color: Colors.white, fontSize: 16),
+                  boxShadow: isFullScreen
+                      ? [BoxShadow(color: Colors.black.withOpacity(0.8), blurRadius: 20)]
+                      : null,
+                ),
+                child: AnimatedBuilder(
+                  animation: _fullScreenAnimation,
+                  builder: (context, child) {
+                    return Transform.scale(
+                      scale: 1.0 + _fullScreenAnimation.value * 0.1,
+                      child: _currentFrame != null
+                          ? Transform.rotate(
+                        angle: math.pi,
+                        child: Image.memory(
+                          _currentFrame!,
+                          fit: BoxFit.cover,
+                          gaplessPlayback: true,
+                          errorBuilder: (context, error, stackTrace) => Container(
+                            color: Colors.black,
+                            child: const Center(
+                              child: Text(
+                                '視訊解碼錯誤',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 16,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      )
+                          : child,
+                    );
+                  },
+                  child: Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        AnimatedBuilder(
+                          animation: _pulseAnimation,
+                          builder: (context, child) {
+                            return Transform.scale(
+                              scale: _pulseAnimation.value,
+                              child: const CircularProgressIndicator(
+                                valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                strokeWidth: 3,
+                              ),
+                            );
+                          },
+                        ),
+                        const SizedBox(height: 16),
+                        const Text(
+                          '正在載入視訊串流...',
+                          style: TextStyle(color: Colors.white, fontSize: 16),
+                        ),
+                      ],
                     ),
                   ),
                 ),
               ),
-            )
-                : Container(
-              color: Colors.black,
-              child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    AnimatedBuilder(
-                      animation: _pulseAnimation,
-                      builder: (context, child) {
-                        return Transform.scale(
-                          scale: _pulseAnimation.value,
-                          child: const CircularProgressIndicator(
-                            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                            strokeWidth: 3,
+            ),
+            Container(color: Colors.black.withOpacity(0.1)),
+            _buildServoSlider1(),
+            _buildTopStatusBar(),
+            _buildBottomControlArea(),
+            Positioned(
+              left: 20,
+              bottom: MediaQuery.of(context).size.height * 0.55,
+              child: Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: Colors.white.withOpacity(0.5),
+                    width: 2,
+                  ),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(18),
+                  child: Material(
+                    color: Colors.transparent,
+                    child: Container(
+                      width: 150,
+                      height: 100,
+                      child: Stack(
+                        children: [
+                          FMap.FlutterMap(
+                            options: FMap.MapOptions(
+                              initialCenter: dronePosition ?? _phonePosition ?? const latLng.LatLng(23.016725, 120.232065),
+                              initialZoom: 18,
+                              interactionOptions: const FMap.InteractionOptions(
+                                flags: FMap.InteractiveFlag.drag | FMap.InteractiveFlag.pinchZoom, // 允許拖拽和縮放
+                              ),
+                            ),
+                            children: [
+                              FMap.TileLayer(
+                                // 根據視圖類型選擇不同的地圖服務
+                                urlTemplate: _isSatelliteView 
+                                    ? 'https://mt{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}&hl=zh-TW' // 衛星視圖
+                                    : 'https://mt{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}&hl=zh-TW', // 標準地圖
+                                subdomains: const ['0', '1', '2', '3'],
+                                userAgentPackageName: 'com.example.drone_app',
+                                additionalOptions: const {
+                                  'User-Agent': 'drone_app/1.0.0',
+                                },
+                                // 備用中文地圖服務
+                                fallbackUrl: 'https://api.mapbox.com/styles/v1/mapbox/streets-v11/tiles/{z}/{x}/{y}?access_token=pk.eyJ1IjoibWFwYm94IiwiYSI6ImNpejY4NXVycTA2emYycXBndHRqcmZ3N3gifQ.rJcFIG214AriISLbB6B5aw&language=zh',
+                              ),
+                              if (dronePosition != null || _phonePosition != null)
+                                FMap.MarkerLayer(
+                                  markers: [
+                                    // 手機位置標記  
+                                    if (_phonePosition != null)
+                                      FMap.Marker(
+                                        point: _phonePosition!,
+                                        width: 25,
+                                        height: 25,
+                                        child: const Icon(
+                                          Icons.phone_android,
+                                          color: Colors.blue,
+                                          size: 20,
+                                        ),
+                                      ),
+                                    // 無人機位置標記
+                                    if (dronePosition != null)
+                                      FMap.Marker(
+                                        point: dronePosition!,
+                                        width: 30,
+                                        height: 30,
+                                        child: const Icon(
+                                          Icons.airplanemode_active,
+                                          color: Colors.red,
+                                          size: 25,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+
+                            ],
                           ),
-                        );
-                      },
+                          // 添加衛星視圖切換按鈕
+                          Positioned(
+                            top: 5,
+                            left: 5,
+                            child: GestureDetector(
+                              onTap: () {
+                                setState(() {
+                                  _isSatelliteView = !_isSatelliteView;
+                                });
+                                log.info('小地圖視圖切換為: ${_isSatelliteView ? "衛星視圖" : "標準地圖"}');
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.all(4),
+                                decoration: BoxDecoration(
+                                  color: Colors.black.withOpacity(0.6),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Icon(
+                                  _isSatelliteView ? Icons.map : Icons.satellite,
+                                  color: _isSatelliteView ? Colors.orange : Colors.white,
+                                  size: 16,
+                                ),
+                              ),
+                            ),
+                          ),
+                          // 添加全螢幕按鈕
+                          Positioned(
+                            top: 5,
+                            right: 5,
+                            child: GestureDetector(
+                              onTap: () {
+                                log.info('小地圖全螢幕按鈕被點擊，開啟全螢幕地圖');
+                                _showFullScreenMap();
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.all(4),
+                                decoration: BoxDecoration(
+                                  color: Colors.black.withOpacity(0.6),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: const Icon(
+                                  Icons.fullscreen,
+                                  color: Colors.white,
+                                  size: 16,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                    const SizedBox(height: 16),
-                  ],
+                  ),
                 ),
               ),
             ),
-            Container(color: Colors.black.withOpacity(0.1)),
-            _buildTopStatusBar(),
-            _buildBottomControlArea(),
-            _buildServoSlider(),
             Positioned(
               right: 20,
               top: (MediaQuery.of(context).size.height - 60) / 2 - 50,
@@ -1169,17 +2436,58 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
                 onPressed: () {
                   _showRecordingOptionsDialog(context);
                 },
-                icon: const Icon(
-                  Icons.movie,
-                  color: Colors.white,
-                  size: 30,
-                ),
+                icon: const Icon(Icons.movie, color: Colors.white, size: 30),
                 style: IconButton.styleFrom(
                   backgroundColor: Colors.black.withOpacity(0.3),
                   shape: const CircleBorder(),
                   padding: const EdgeInsets.all(10),
                 ),
                 tooltip: '錄影選項',
+              ),
+            ),
+            if (isFullScreen)
+              Positioned(
+                top: 100,
+                right: 20,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.7),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.fullscreen,
+                        color: Colors.white,
+                        size: 14,
+                      ),
+                      const SizedBox(width: 4),
+                      const Text(
+                        '全螢幕模式',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            Positioned(
+              right: 20,
+              top: (MediaQuery.of(context).size.height - 60) / 2 + 80,
+              child: IconButton(
+                onPressed: takePhoto,
+                icon: const Icon(Icons.camera_alt, color: Colors.white, size: 28),
+                style: IconButton.styleFrom(
+                  backgroundColor: Colors.black.withOpacity(0.3),
+                  shape: const CircleBorder(),
+                  padding: const EdgeInsets.all(12),
+                ),
+                tooltip: '拍照',
               ),
             ),
             Positioned(
@@ -1206,7 +2514,9 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
 class AnimatedJoystickStick extends StatefulWidget {
   final double x;
   final double y;
+
   const AnimatedJoystickStick({super.key, required this.x, required this.y});
+
   @override
   _AnimatedJoystickStickState createState() => _AnimatedJoystickStickState();
 }
@@ -1218,7 +2528,10 @@ class _AnimatedJoystickStickState extends State<AnimatedJoystickStick> with Sing
   @override
   void initState() {
     super.initState();
-    _scaleController = AnimationController(duration: const Duration(milliseconds: 150), vsync: this);
+    _scaleController = AnimationController(
+      duration: const Duration(milliseconds: 150),
+      vsync: this,
+    );
     _scaleAnimation = Tween<double>(begin: 1.0, end: 1.15).animate(
       CurvedAnimation(parent: _scaleController, curve: Curves.easeInOut),
     );
@@ -1227,9 +2540,11 @@ class _AnimatedJoystickStickState extends State<AnimatedJoystickStick> with Sing
   @override
   void didUpdateWidget(AnimatedJoystickStick oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if ((widget.x != 0 || widget.y != 0) && (_scaleController.status == AnimationStatus.dismissed || _scaleController.status == AnimationStatus.reverse)) {
+    if ((widget.x != 0 || widget.y != 0) &&
+        (_scaleController.status == AnimationStatus.dismissed || _scaleController.status == AnimationStatus.reverse)) {
       _scaleController.forward();
-    } else if (widget.x == 0 && widget.y == 0 && (_scaleController.status == AnimationStatus.completed || _scaleController.status == AnimationStatus.forward)) {
+    } else if (widget.x == 0 && widget.y == 0 &&
+        (_scaleController.status == AnimationStatus.completed || _scaleController.status == AnimationStatus.forward)) {
       _scaleController.reverse();
     }
   }
@@ -1279,6 +2594,65 @@ class _AnimatedJoystickStickState extends State<AnimatedJoystickStick> with Sing
   }
 }
 
+class ServoTrackPainter extends CustomPainter {
+  final double servoAngle;
+  final bool isDragging;
+
+  ServoTrackPainter({required this.servoAngle, required this.isDragging});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white.withOpacity(isDragging ? 0.9 : 0.5)
+      ..strokeWidth = 4.0
+      ..style = PaintingStyle.stroke;
+
+    final trackPaint = Paint()
+      ..color = Colors.grey.withOpacity(0.4)
+      ..strokeWidth = 8.0
+      ..style = PaintingStyle.stroke;
+
+    final sliderPaint = Paint()
+      ..color = isDragging ? Colors.blueAccent.shade400 : Colors.white
+      ..style = PaintingStyle.fill;
+
+    final centerX = size.width / 2;
+    final trackHeight = size.height - 20;
+    final trackTop = 10.0;
+    final trackBottom = trackHeight + 10;
+
+    // 繪製軌道
+    canvas.drawLine(
+      Offset(centerX, trackTop),
+      Offset(centerX, trackBottom),
+      trackPaint,
+    );
+
+    // 計算滑塊位置
+    final normalized = (servoAngle + 45) / 135;
+    final sliderY = trackBottom - normalized * trackHeight;
+    canvas.drawCircle(
+      Offset(centerX, sliderY.clamp(trackTop, trackBottom)),
+      isDragging ? 12.0 : 10.0,
+      sliderPaint,
+    );
+
+    // 繪製滑塊陰影
+    if (isDragging) {
+      canvas.drawCircle(
+        Offset(centerX, sliderY.clamp(trackTop, trackBottom)),
+        14.0,
+        Paint()
+          ..color = Colors.black.withOpacity(0.3)
+          ..style = PaintingStyle.fill,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
+
 class JoystickCrosshairPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
@@ -1306,6 +2680,7 @@ class JoystickCrosshairPainter extends CustomPainter {
 
 class JoystickBase extends StatelessWidget {
   final JoystickMode mode;
+
   const JoystickBase({super.key, this.mode = JoystickMode.all});
 
   @override
@@ -1316,7 +2691,10 @@ class JoystickBase extends StatelessWidget {
       decoration: BoxDecoration(
         shape: BoxShape.circle,
         gradient: RadialGradient(
-          colors: [Colors.blueGrey.shade800.withOpacity(0.5), Colors.black.withOpacity(0.6)],
+          colors: [
+            Colors.blueGrey.shade800.withOpacity(0.5),
+            Colors.black.withOpacity(0.6),
+          ],
           stops: const [0.7, 1.0],
           center: Alignment.center,
           radius: 0.9,
@@ -1345,7 +2723,13 @@ class JoystickBase extends StatelessWidget {
 class RecordButton extends StatefulWidget {
   final bool isRecording;
   final VoidCallback onTap;
-  const RecordButton({super.key, required this.isRecording, required this.onTap});
+
+  const RecordButton({
+    super.key,
+    required this.isRecording,
+    required this.onTap,
+  });
+
   @override
   State<RecordButton> createState() => _RecordButtonState();
 }
@@ -1359,17 +2743,23 @@ class _RecordButtonState extends State<RecordButton> with SingleTickerProviderSt
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(duration: const Duration(milliseconds: 500), vsync: this);
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 500),
+      vsync: this,
+    );
     _sizeAnim = Tween<double>(begin: 30, end: 20).animate(
       CurvedAnimation(parent: _controller, curve: Curves.easeInOutSine),
     );
     _borderAnim = BorderRadiusTween(
       begin: BorderRadius.circular(30),
       end: BorderRadius.circular(8),
-    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeInOutSine));
-    _pulseAnimIcon = Tween<double>(begin: 1.0, end: 0.0).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+    ).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeInOutSine),
     );
+    _pulseAnimIcon = Tween<double>(
+      begin: 1.0,
+      end: 0.0,
+    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeInOut));
     if (widget.isRecording) {
       _controller.forward();
     }
@@ -1402,11 +2792,21 @@ class _RecordButtonState extends State<RecordButton> with SingleTickerProviderSt
         width: 60,
         height: 60,
         decoration: BoxDecoration(
-          color: widget.isRecording ? Colors.red.withOpacity(0.7) : Colors.black.withOpacity(0.3),
+          color: widget.isRecording
+              ? Colors.red.withOpacity(0.7)
+              : Colors.black.withOpacity(0.3),
           borderRadius: BorderRadius.circular(30),
-          border: Border.all(color: widget.isRecording ? Colors.red.shade900 : Colors.grey.shade700, width: 3),
+          border: Border.all(
+            color: widget.isRecording ? Colors.red.shade900 : Colors.grey.shade700,
+            width: 3,
+          ),
           boxShadow: widget.isRecording
-              ? [BoxShadow(color: Colors.red.withOpacity(0.5), blurRadius: 10)]
+              ? [
+            BoxShadow(
+              color: Colors.red.withOpacity(0.5),
+              blurRadius: 10,
+            ),
+          ]
               : [],
         ),
         child: Center(
@@ -1421,7 +2821,9 @@ class _RecordButtonState extends State<RecordButton> with SingleTickerProviderSt
                   borderRadius: _borderAnim.value,
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.red.shade900.withOpacity(widget.isRecording ? 0.7 : 0.3),
+                      color: Colors.red.shade900.withOpacity(
+                        widget.isRecording ? 0.7 : 0.3,
+                      ),
                       blurRadius: widget.isRecording ? 8 : 3,
                       spreadRadius: widget.isRecording ? 2 : 0,
                     ),

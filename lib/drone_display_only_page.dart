@@ -54,7 +54,7 @@ class _DroneDisplayOnlyPageState extends State<DroneDisplayOnlyPage> with Ticker
     _pulseController.repeat(reverse: true);
 
     _controller = DroneController(
-      onStatusChanged: (status, connected, [angle, led]) {
+      onStatusChanged: (status, connected, [angle, led, gpsData]) {
         setState(() {
           isWebSocketConnected = connected;
           log.info('WebSocket 狀態: $status, 連線: $connected');
@@ -66,6 +66,10 @@ class _DroneDisplayOnlyPageState extends State<DroneDisplayOnlyPage> with Ticker
           if (led != null) {
             _ledEnabled = led;
             log.info('LED 狀態更新: $_ledEnabled');
+          }
+          // GPS 數據處理（如果需要的話）
+          if (gpsData != null) {
+            log.info('GPS 數據接收: $gpsData');
           }
         });
       },

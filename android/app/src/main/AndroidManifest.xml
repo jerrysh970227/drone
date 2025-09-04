@@ -2,11 +2,24 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" /> <!-- 添加以確保網絡狀態檢查 -->
+    <!-- 位置權限 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <application
         android:label="drone_app"
         android:icon="@mipmap/ic_launcher"
         android:networkSecurityConfig="@xml/network_security_config"
-        android:hardwareAccelerated="false"> <!-- 禁用硬體加速 -->
+        android:hardwareAccelerated="true"> <!-- 啟用硬體加速以支援 3D 地圖 -->
+        <!-- Google Maps API 金鑰 - 請替換為您的實際 API 金鑰 -->
+        <!-- 獲取 API 金鑰步驟：
+             1. 前往 https://console.cloud.google.com/
+             2. 啟用 "Maps SDK for Android" API
+             3. 建立 API 金鑰
+             4. 將下面的 YOUR_GOOGLE_MAPS_API_KEY 替換為實際金鑰 -->
+        <meta-data
+            android:name="com.google.android.geo.API_KEY"
+            android:value="AIzaSyB_2IN80GqTBqeOV-NnFad0ruFmJ9pZGHM"/>
         <activity
             android:name=".MainActivity"
             android:exported="true"

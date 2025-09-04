@@ -2,11 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:logging/logging.dart';
 import 'package:web_socket_channel/io.dart';
+import 'package:latlong2/latlong.dart';
 import 'constants.dart';
 
 class DroneController {
   final Logger log = Logger('DroneController');
-  final Function(String, bool, [double? angle, bool? led]) onStatusChanged;
+  final Function(String, bool, [double? angle, bool? led, Map<String, dynamic>? gpsData]) onStatusChanged;
+  final StreamController<LatLng> _positionStreamController = StreamController<LatLng>.broadcast();
+  Stream<LatLng> get positionStream => _positionStreamController.stream;
   IOWebSocketChannel? _channel;
   Timer? _reconnectTimer;
   Timer? _controlTimer;
@@ -22,10 +25,21 @@ class DroneController {
 
   DroneController({required this.onStatusChanged});
 
-  void _updateStatus(String status, bool connected, [double? angle, bool? led]) {
+  void _updateStatus(String status, bool connected, [double? angle, bool? led, Map<String, dynamic>? gpsData]) {
     _isWebSocketConnected = connected;
     connectionStatus = status;
-    onStatusChanged(status, connected, angle, led);
+    onStatusChanged(status, connected, angle, led, gpsData);
+    log.info('Status updated: $status, Connected: $connected, Angle: $angle, LED: $led, GPS: $gpsData');
+  }
+
+  void _updateDronePosition(double lat, double lon) {
+    if (lat.isFinite && lon.isFinite) {
+      final position = LatLng(lat, lon);
+      _positionStreamController.add(position);
+      log.info('Updated drone position: $position');
+    } else {
+      log.warning('Invalid GPS data: lat=$lat, lon=$lon');
+    }
   }
 
   Future<void> connect() async {
@@ -55,13 +69,25 @@ class DroneController {
           log.info('Data received: $data');
           try {
             var response = jsonDecode(data);
-            if (response['status'] == 'received' || response['status'] == 'ok') {
+            if (response['type'] == 'gps') {
+              final gpsData = response['data'];
+              if (gpsData != null && gpsData['lat'] is num && gpsData['lon'] is num) {
+                _updateDronePosition(gpsData['lat'].toDouble(), gpsData['lon'].toDouble());
+                // 也通過回調傳遞 GPS 數據
+                _updateStatus('Connected', true, null, null, gpsData);
+              } else {
+                log.warning('Invalid GPS data format: $gpsData');
+              }
+            } else if (response['type'] == 'angle_update') {
               _updateStatus('Connected', true, response['angle']?.toDouble(), response['led']);
+            } else if (response['status'] == 'received' || response['status'] == 'ok') {
+              _updateStatus('Connected', true, response['angle']?.toDouble(), response['led']);
+              _retries = 0; // Reset retries on successful connection
             } else if (response['status'] == 'error') {
               _updateStatus('Error: ${response['message']}', true);
             }
           } catch (e) {
-            log.severe('解析消息失敗: $e');
+            log.severe('Failed to parse message: $e');
           }
         },
         onDone: () {
@@ -91,6 +117,7 @@ class DroneController {
   void _scheduleReconnect() {
     if (_retries >= maxRetries) {
       _updateStatus('Error: Max retries reached', false);
+      log.severe('Max reconnection retries reached');
       return;
     }
     _retries++;
@@ -103,9 +130,23 @@ class DroneController {
       log.warning('Cannot send command: WebSocket not connected');
       return;
     }
-    final message = jsonEncode({'type': 'command', 'action': action});
-    _channel!.sink.add(message);
-    log.info('Sent command: $message');
+
+    Map<String, dynamic> message;
+    if (action == 'ARM' || action == 'DISARM') {
+      message = {
+        'type': 'arm',
+        'arm': action == 'ARM',
+      };
+    } else {
+      message = {
+        'type': 'command',
+        'action': action,
+      };
+    }
+
+    final messageString = jsonEncode(message);
+    _channel!.sink.add(messageString);
+    log.info('Sent command: $messageString');
   }
 
   void sendLedCommand(String action) {
@@ -113,20 +154,20 @@ class DroneController {
       log.warning('Cannot send LED command: WebSocket not connected');
       return;
     }
-    final message = jsonEncode({'type': 'command', 'action': action});
+    final message = jsonEncode({'type': 'led_control', 'action': action});
     _channel!.sink.add(message);
     log.info('Sent LED command: $message');
   }
 
   void sendServoSpeed(double speed) {
     if (!_isWebSocketConnected || _channel == null) {
-      log.warning('無法發送伺服速度：WebSocket未連線');
+      log.warning('Cannot send servo speed: WebSocket not connected');
       return;
     }
     if ((speed - _lastSpeed).abs() > 0.01) {
       final message = jsonEncode({'type': 'servo_speed', 'speed': speed.clamp(-1.0, 1.0)});
       _channel!.sink.add(message);
-      log.info('發送伺服速度：${(speed * 100).toStringAsFixed(1)}%');
+      log.info('Sent servo speed: ${(speed * 100).toStringAsFixed(1)}%');
       _lastSpeed = speed;
     }
   }
@@ -136,7 +177,6 @@ class DroneController {
       log.warning('Cannot send servo angle: WebSocket not connected');
       return;
     }
-    // Align with server protocol: use 'servo_control' and clamp to [-45, 90]
     final message = jsonEncode({'type': 'servo_control', 'angle': angle.clamp(-45.0, 90.0)});
     _channel!.sink.add(message);
     log.info('Sent servo angle: ${angle.toStringAsFixed(1)}°');
@@ -157,6 +197,7 @@ class DroneController {
     _controlTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) {
       if (!_isWebSocketConnected || _channel == null) {
         timer.cancel();
+        log.warning('Control timer cancelled: WebSocket not connected');
         return;
       }
       const threshold = 0.05;
@@ -172,6 +213,7 @@ class DroneController {
           'lateral': lateral.clamp(-1.0, 1.0),
         });
         _channel!.sink.add(message);
+        log.info('Sent control: $message');
         _lastThrottle = throttle;
         _lastYaw = yaw;
         _lastForward = forward;
@@ -182,6 +224,7 @@ class DroneController {
 
   void stopSendingControl() {
     _controlTimer?.cancel();
+    log.info('Stopped sending control commands');
   }
 
   void disconnect() {
@@ -191,9 +234,12 @@ class DroneController {
     _channel = null;
     _retries = 0;
     _updateStatus('Disconnected', false);
+    log.info('Disconnected from WebSocket');
   }
 
   void dispose() {
     disconnect();
+    _positionStreamController.close();
+    log.info('DroneController disposed');
   }
 }
