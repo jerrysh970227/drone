@@ -9,6 +9,14 @@ import 'maps.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 系統狀態列/導覽列樣式（與首頁深色系一致）
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Color(0xFFBFC2DF),
+    statusBarIconBrightness: Brightness.light, // Android 狀態列圖示顏色
+    statusBarBrightness: Brightness.dark, // iOS 狀態列內容顏色
+    systemNavigationBarColor: Color(0xBFC2DFFF),
+    systemNavigationBarIconBrightness: Brightness.light,
+  ));
   // 日誌設定
   Logger.root.level = Level.ALL;
   Logger.root.onRecord.listen((record) {

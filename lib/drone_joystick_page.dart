@@ -32,6 +32,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
   bool _aiRescueEnabled = false;
   bool _ledEnabled = false;
   bool _useSliderControl = false; // 控制伺服馬達方式（false: 按鈕控制, true: 滑桿）
+  bool _usePhoneAsMapCenter = false; // 控制地圖中心顯示（false: 無人機位置, true: 手機位置）
   final Logger log = Logger('DroneJoystickPage');
   late final DroneController _controller;
   late AnimationController _pulseController;
@@ -75,6 +76,8 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
   late AnimationController _fullScreenController;
   late Animation<double> _fullScreenAnimation;
   Timer? _locationUpdateTimer; // 定期更新位置
+  // 小地圖控制器，用於回到目前模式中心
+  final FMap.MapController _miniMapController = FMap.MapController();
 
   @override
   void initState() {
@@ -108,39 +111,39 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
     );
 
     _controller = DroneController(
-      onStatusChanged: (status, connected, [angle, led, gpsData]) {
+      onStatusChanged: (DroneStatus status) {
         setState(() {
-          isWebSocketConnected = connected;
-          log.info('WebSocket 狀態: $status, 連線: $connected');
-          if (angle != null && angle >= -45.0 && angle <= 90.0) {
+          isWebSocketConnected = status.isConnected;
+          log.info('WebSocket 狀態: ${status.connectionState}, 連線: ${status.isConnected}');
+          if (status.servoAngle != null && status.servoAngle! >= -45.0 && status.servoAngle! <= 90.0) {
             if (!_isDraggingServo) {
-              _servoAngle = double.parse(angle.toStringAsFixed(2));
+              _servoAngle = double.parse(status.servoAngle!.toStringAsFixed(2));
               _lastServoUiUpdate = DateTime.now();
               log.info('伺服角度更新: ${_servoAngle!.toStringAsFixed(2)}°');
             }
           }
-          if (led != null) {
-            _ledEnabled = led;
+          if (status.ledState != null) {
+            _ledEnabled = status.ledState!;
             log.info('LED 狀態更新: $_ledEnabled');
           }
           // 處理 GPS 數據
-          if (gpsData != null && gpsData is Map<String, dynamic>) {
-            final lat = gpsData['lat'];
-            final lon = gpsData['lon'];
-            if (lat != null && lon != null) {
-              dronePosition = latLng.LatLng(lat.toDouble(), lon.toDouble());
-              log.info('無人機位置更新: $lat, $lon');
-            }
-          }
+          // Note: GPS data is not part of DroneStatus in the current implementation
         });
+      },
+      onLogMessage: (String message, {bool isError = false}) {
+        log.info('控制器訊息: $message');
+        if (isError) {
+          log.severe('控制器錯誤: $message');
+        }
       },
     );
     _controller.connect();
     _connectToStream();
 
-    _anglePollTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+    _anglePollTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
       if (isWebSocketConnected) {
-        _controller.requestServoAngle();
+        // Use sendCommand to request servo angle instead
+        _controller.sendCommand('REQUEST_SERVO_ANGLE');
       }
     });
     _getCurrentLocation();
@@ -456,9 +459,19 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
   Widget _buildTabletFlutterMap() {
     log.info('構建平板專用 FlutterMap - 衛星模式: $_isSatelliteView');
     
+    // 根據設置決定地圖中心位置
+    latLng.LatLng mapCenter;
+    if (_usePhoneAsMapCenter) {
+      mapCenter = _phonePosition ?? dronePosition ?? const latLng.LatLng(25.0330, 121.5654); // 台北101附近
+      log.info('平板地圖中心設為手機位置: ${_phonePosition?.latitude}, ${_phonePosition?.longitude}');
+    } else {
+      mapCenter = dronePosition ?? _phonePosition ?? const latLng.LatLng(25.0330, 121.5654); // 台北101附近
+      log.info('平板地圖中心設為無人機位置: ${dronePosition?.latitude}, ${dronePosition?.longitude}');
+    }
+    
     return FMap.FlutterMap(
       options: FMap.MapOptions(
-        initialCenter: dronePosition ?? _phonePosition ?? const latLng.LatLng(25.0330, 121.5654), // 台北101附近
+        initialCenter: mapCenter,
         initialZoom: 16.0, // 適合的初始縮放級別
         minZoom: 3.0,
         maxZoom: 22.0,
@@ -618,10 +631,8 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
             // 使用新的地圖類型選擇方法，確保 3D 衛星模式正確運作
             mapType: _determineOptimalMapType(),
             initialCameraPosition: _currentCameraPosition ?? GMaps.CameraPosition(
-              target: GMaps.LatLng(
-                dronePosition?.latitude ?? _phonePosition?.latitude ?? 25.0330, // 預設在台北101附近以測試3D效果
-                dronePosition?.longitude ?? _phonePosition?.longitude ?? 121.5654,
-              ),
+              target: _determineMapCenter(),
+              
               // 所有模式都使用 3D，平板使用更高縮放以確保 3D 建築顯示
               zoom: isTablet ? 18.0 : 16.0, // 平板使用更高縮放級別
               tilt: _isSatelliteView ? 70.0 : (isTablet ? 60.0 : 45.0), // 平板使用更大 3D 傾斜角度
@@ -952,6 +963,27 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
       return GMaps.MapType.normal;
     }
   }
+  
+  // 決定地圖中心位置的方法
+  GMaps.LatLng _determineMapCenter() {
+    GMaps.LatLng mapCenter;
+    if (_usePhoneAsMapCenter) {
+      mapCenter = _phonePosition != null 
+          ? GMaps.LatLng(_phonePosition!.latitude, _phonePosition!.longitude)
+          : (dronePosition != null 
+              ? GMaps.LatLng(dronePosition!.latitude, dronePosition!.longitude)
+              : const GMaps.LatLng(25.0330, 121.5654)); // 台北101附近
+      log.info('Google Maps 地圖中心設為手機位置: ${_phonePosition?.latitude}, ${_phonePosition?.longitude}');
+    } else {
+      mapCenter = dronePosition != null 
+          ? GMaps.LatLng(dronePosition!.latitude, dronePosition!.longitude)
+          : (_phonePosition != null 
+              ? GMaps.LatLng(_phonePosition!.latitude, _phonePosition!.longitude)
+              : const GMaps.LatLng(25.0330, 121.5654)); // 台北101附近
+      log.info('Google Maps 地圖中心設為無人機位置: ${dronePosition?.latitude}, ${dronePosition?.longitude}');
+    }
+    return mapCenter;
+  }
 
   // 強制設置 3D 視角的方法（所有模式都使用 3D）
   void _force3DView(GMaps.GoogleMapController controller) {
@@ -990,9 +1022,18 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
 
   Widget _buildFlutterMapFallback() {
     log.info('使用 FlutterMap 作為地圖備援');
+    // 根據設置決定地圖中心位置
+    latLng.LatLng mapCenter;
+    if (_usePhoneAsMapCenter) {
+      mapCenter = _phonePosition ?? dronePosition ?? const latLng.LatLng(23.016725, 120.232065);
+      log.info('地圖中心設為手機位置: ${_phonePosition?.latitude}, ${_phonePosition?.longitude}');
+    } else {
+      mapCenter = dronePosition ?? _phonePosition ?? const latLng.LatLng(23.016725, 120.232065);
+      log.info('地圖中心設為無人機位置: ${dronePosition?.latitude}, ${dronePosition?.longitude}');
+    }
     return FMap.FlutterMap(
       options: FMap.MapOptions(
-        initialCenter: dronePosition ?? _phonePosition ?? const latLng.LatLng(23.016725, 120.232065),
+        initialCenter: mapCenter,
         initialZoom: 16,
         interactionOptions: const FMap.InteractionOptions(
           flags: FMap.InteractiveFlag.all,
@@ -1086,17 +1127,20 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
 
   void _updateServoAngle(double newAngle) {
     _debounceTimer?.cancel();
-    final clampedAngle = newAngle.clamp(-45.0, 90.0);
-    setState(() {
-      _servoAngle = double.parse(clampedAngle.toStringAsFixed(2));
+    // Increase debounce time to reduce jitter
+    _debounceTimer = Timer(const Duration(milliseconds: 50), () {
+      final clampedAngle = newAngle.clamp(-45.0, 90.0);
+      setState(() {
+        _servoAngle = double.parse(clampedAngle.toStringAsFixed(1)); // Reduce precision to avoid jitter
+      });
+      if (isWebSocketConnected) {
+        log.info('【伺服指令】即將送出角度: ${_servoAngle!.toStringAsFixed(1)}°');
+        _controller.sendServoAngle(_servoAngle!);
+        log.info('【伺服指令】已送出角度: ${_servoAngle!.toStringAsFixed(1)}°');
+      } else {
+        log.warning('WebSocket未連線，伺服指令未發送');
+      }
     });
-    if (isWebSocketConnected) {
-      log.info('【伺服指令】即將送出角度: ${_servoAngle!.toStringAsFixed(2)}°');
-      _controller.sendServoAngle(_servoAngle!);
-      log.info('【伺服指令】已送出角度: ${_servoAngle!.toStringAsFixed(2)}°');
-    } else {
-      log.warning('WebSocket未連線，伺服指令未發送');
-    }
   }
 
   void _incrementServoAngle() {
@@ -1113,7 +1157,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
 
   void _toggleLed() {
     if (isWebSocketConnected) {
-      _controller.sendCommand(jsonEncode({
+      _controller.sendLedCommand(jsonEncode({
         'type': 'led_control',
         'action': _ledEnabled ? 'LED_OFF' : 'LED_ON',
       }));
@@ -1492,6 +1536,23 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
           },
         ),
       ),
+      ListTile(
+        leading: const Icon(Icons.map, color: Colors.white),
+        title: const Text('地圖中心顯示', style: TextStyle(color: Colors.white)),
+        subtitle: Text(_usePhoneAsMapCenter ? '以手機位置為中心' : '以無人機位置為中心', style: const TextStyle(color: Colors.white70, fontSize: 12)),
+        trailing: Switch(
+          value: _usePhoneAsMapCenter,
+          onChanged: (bool value) {
+            innerSetState(() {
+              _usePhoneAsMapCenter = value;
+            });
+            setState(() {
+              _usePhoneAsMapCenter = value;
+              log.info('地圖中心顯示切換為: ${_usePhoneAsMapCenter ? '手機位置' : '無人機位置'}');
+            });
+          },
+        ),
+      ),
       const Text(
         '模式選擇',
         style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
@@ -1682,7 +1743,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
               tooltip: '視訊串流',
             ),
             const SizedBox(width: 8),
-            _buildLedButton(),
             const Spacer(),
             Text(
               '伺服: ${_servoAngle?.toStringAsFixed(1) ?? 0.0}°',
@@ -1969,24 +2029,50 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
     }
   }
 
+  // 應用死區處理（減少死區以提高靈敏度）
+  double _applyDeadzone(double value, {double deadzone = 0.03}) {
+    if (value.abs() < deadzone) return 0.0;
+    final sign = value.isNegative ? -1.0 : 1.0;
+    final magnitude = ((value.abs() - deadzone) / (1.0 - deadzone)).clamp(0.0, 1.0);
+    return sign * magnitude;
+  }
+
+  // 特別的油門死區處理（減少死區以提高靈敏度）
+  double _applyThrottleDeadzone(double value) {
+    const throttleDeadzone = 0.04; // 減少油門死區以提高靈敏度
+    if (value.abs() < throttleDeadzone) return 0.0;
+    final sign = value.isNegative ? -1.0 : 1.0;
+    final magnitude = ((value.abs() - throttleDeadzone) / (1.0 - throttleDeadzone)).clamp(0.0, 1.0);
+    return sign * magnitude;
+  }
+
+  // 應用指數曲線增強精確控制（減少指數效應以提高靈敏度）
+  double _applyExpo(double value, {double expo = 0.15}) {
+    return value * (1.0 - expo) + (value * value * value) * expo;
+  }
+
+  // 線性插值平滑處理（減少平滑以降低延遲）
+  double _lerp(double current, double target, double smoothing) {
+    return current + (target - current) * smoothing;
+  }
+
   void _updateControlValues(JoystickMode mode, double x, double y) {
-    setState(() {
-      if (mode == JoystickMode.all) {
-        if (x.abs() > 0.1 || y.abs() > 0.1) {
-          _smoothedYaw = _smoothedYaw + (x - _smoothedYaw) * 0.3;
-          yaw = _smoothedYaw.clamp(-1.0, 1.0);
-          _smoothedThrottle = _smoothedThrottle + (y - _smoothedThrottle) * 0.3;
-          throttle = _smoothedThrottle.clamp(-1.0, 1.0);
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 20), () {
+      setState(() {
+        if (mode == JoystickMode.all) {
+          throttle = -y;  // 油門：Y軸反向
+          yaw = x;        // 偏航：X軸
         } else {
-          yaw = 0.0;
-          _smoothedYaw = 0.0;
-          throttle = 0.0;
-          _smoothedThrottle = 0.0;
+          forward = -y;   // 前進：Y軸反向
+          lateral = x;    // 橫移：X軸
         }
-      }
-      if (isWebSocketConnected) {
-        _controller.startSendingControl(throttle, yaw, forward, lateral);
-      }
+        if (isWebSocketConnected) {
+          _controller.startContinuousControl(throttle, yaw, forward, lateral);
+        } else {
+          _controller.stopContinuousControl();
+        }
+      });
     });
   }
 
@@ -2002,15 +2088,12 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
           _buildJoystickWithLabel(
             label: '油門/偏航',
             mode: JoystickMode.all,
-            onUpdate: (x, y) => _updateControlValues(JoystickMode.all, x, -y),
+            onUpdate: (x, y) => _updateControlValues(JoystickMode.all, x, y),
             onEnd: () {
               setState(() {
-                yaw = 0.0;
-                _smoothedYaw = 0.0;
-                throttle = 0.0;
-                _smoothedThrottle = 0.0;
+                throttle = yaw = 0;
                 if (isWebSocketConnected) {
-                  _controller.startSendingControl(throttle, yaw, forward, lateral);
+                  _controller.startContinuousControl(0, 0, forward, lateral);
                 }
               });
             },
@@ -2025,20 +2108,20 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
                     Icons.flight_takeoff_rounded,
                     '啟動',
                     isWebSocketConnected ? Colors.greenAccent.shade700 : Colors.grey.shade700,
-                    isWebSocketConnected ? () => _controller.sendCommand(jsonEncode({
-                      'type': 'arm',
-                      'arm': true,
-                    })) : null,
+                    isWebSocketConnected ? () {
+                      // 使用舊版本簡潔的 ARM 邏輯
+                      _controller.sendCommand('ARM');
+                    } : null,
                   ),
                   const SizedBox(width: 10),
                   _buildActionButton(
                     Icons.flight_land_rounded,
                     '解除',
                     isWebSocketConnected ? Colors.redAccent.shade400 : Colors.grey.shade700,
-                    isWebSocketConnected ? () => _controller.sendCommand(jsonEncode({
-                      'type': 'arm',
-                      'arm': false,
-                    })) : null,
+                    isWebSocketConnected ? () {
+                      // 使用舊版本簡潔的 DISARM 邏輯
+                      _controller.sendCommand('DISARM');
+                    } : null,
                   ),
                 ],
               ),
@@ -2048,26 +2131,12 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
           _buildJoystickWithLabel(
             label: '前進/橫移',
             mode: JoystickMode.all,
-            onUpdate: (x, y) => setState(() {
-              if (x.abs() > 0.1 || y.abs() > 0.1) {
-                _smoothedForward = _smoothedForward + (y - _smoothedForward) * 0.3;
-                _smoothedLateral = _smoothedLateral + (x - _smoothedLateral) * 0.3;
-                forward = _smoothedForward.clamp(-1.0, 1.0);
-                lateral = _smoothedLateral.clamp(-1.0, 1.0);
-              } else {
-                forward = lateral = 0;
-                _smoothedForward = _smoothedLateral = 0.0;
-              }
-              if (isWebSocketConnected) {
-                _controller.startSendingControl(throttle, yaw, forward, lateral);
-              }
-            }),
+            onUpdate: (x, y) => _updateControlValues(JoystickMode.horizontalAndVertical, x, y),
             onEnd: () {
               setState(() {
                 forward = lateral = 0;
-                _smoothedForward = _smoothedLateral = 0.0;
                 if (isWebSocketConnected) {
-                  _controller.startSendingControl(throttle, yaw, 0, 0);
+                  _controller.startContinuousControl(throttle, yaw, 0, 0);
                 }
               });
             },
@@ -2192,14 +2261,25 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
   }
 
   void takePhoto() async {
-    if (_currentFrame == null) {
-      log.warning('無法拍照：無當前畫面');
-      return;
-    }
     try {
-      log.info('拍照成功');
+      final uri = Uri.parse('http://${AppConfig.droneIP}:8770/photo');
+      final res = await http.post(uri).timeout(const Duration(seconds: 8));
+      if (res.statusCode == 200) {
+        log.info('拍照成功');
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('已拍照')),
+        );
+      } else {
+        log.severe('拍照失敗: ${res.body}');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('拍照失敗: ${res.statusCode}')),
+        );
+      }
     } catch (e) {
-      log.severe('拍照失敗：$e');
+      log.severe('拍照錯誤: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('拍照錯誤: $e')),
+      );
     }
   }
 
@@ -2285,11 +2365,10 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
                             );
                           },
                         ),
-                        const SizedBox(height: 16),
-                        const Text(
-                          '正在載入視訊串流...',
-                          style: TextStyle(color: Colors.white, fontSize: 16),
-                        ),
+                        // const Text(
+                        //   '正在載入視訊串流...',
+                        //   style: TextStyle(color: Colors.white, fontSize: 16),
+                        // ),
                       ],
                     ),
                   ),
@@ -2321,6 +2400,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
                       child: Stack(
                         children: [
                           FMap.FlutterMap(
+                            mapController: _miniMapController,
                             options: FMap.MapOptions(
                               initialCenter: dronePosition ?? _phonePosition ?? const latLng.LatLng(23.016725, 120.232065),
                               initialZoom: 18,
@@ -2394,6 +2474,41 @@ class _DroneJoystickPageState extends State<DroneJoystickPage> with TickerProvid
                                 child: Icon(
                                   _isSatelliteView ? Icons.map : Icons.satellite,
                                   color: _isSatelliteView ? Colors.orange : Colors.white,
+                                  size: 16,
+                                ),
+                              ),
+                            ),
+                          ),
+                          // 添加地圖中心切換按鈕
+                          Positioned(
+                            top: 5,
+                            right: 35,
+                            child: GestureDetector(
+                              onTap: () {
+                                // 回到目前模式中心（不切換圖示與模式）
+                                final latLng.LatLng? target = _usePhoneAsMapCenter
+                                    ? (_phonePosition ?? dronePosition)
+                                    : (dronePosition ?? _phonePosition);
+                                if (target != null) {
+                                  try {
+                                    _miniMapController.move(target, 18.0);
+                                    log.info('小地圖回到目前模式中心: ${_usePhoneAsMapCenter ? "手機" : "無人機"} -> (${target.latitude}, ${target.longitude})');
+                                  } catch (e) {
+                                    log.warning('小地圖移動失敗: $e');
+                                  }
+                                } else {
+                                  log.warning('小地圖無可用位置可回到中心');
+                                }
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.all(4),
+                                decoration: BoxDecoration(
+                                  color: Colors.black.withOpacity(0.6),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Icon(
+                                  _usePhoneAsMapCenter ? Icons.phone_android : Icons.airplanemode_active, // 修正图标逻辑
+                                  color: _usePhoneAsMapCenter ? Colors.blue : Colors.red, // 修正颜色逻辑
                                   size: 16,
                                 ),
                               ),

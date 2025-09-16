@@ -1,245 +1,526 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'package:logging/logging.dart';
 import 'package:web_socket_channel/io.dart';
-import 'package:latlong2/latlong.dart';
-import 'constants.dart';
+import '../constants.dart';
+
+enum ConnectionState {
+  disconnected,
+  connecting,
+  connected,
+  reconnecting,
+  error,
+}
+
+class DroneStatus {
+  final ConnectionState connectionState;
+  final String message;
+  final double? servoAngle;
+  final bool? ledState;
+  final DateTime timestamp;
+
+  DroneStatus({
+    required this.connectionState,
+    required this.message,
+    this.servoAngle,
+    this.ledState,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+
+  bool get isConnected => connectionState == ConnectionState.connected;
+  
+  @override
+  String toString() => 'DroneStatus(state: $connectionState, message: $message, angle: $servoAngle, led: $ledState)';
+}
+
+class ControlValues {
+  final double throttle;
+  final double yaw;
+  final double forward;
+  final double lateral;
+
+  const ControlValues({
+    required this.throttle,
+    required this.yaw,
+    required this.forward,
+    required this.lateral,
+  });
+
+  ControlValues clamp() => ControlValues(
+    throttle: throttle.clamp(-1.0, 1.0),
+    yaw: yaw.clamp(-1.0, 1.0),
+    forward: forward.clamp(-1.0, 1.0),
+    lateral: lateral.clamp(-1.0, 1.0),
+  );
+
+  bool differenceExceeds(ControlValues other, double threshold) {
+    return (throttle - other.throttle).abs() > threshold ||
+           (yaw - other.yaw).abs() > threshold ||
+           (forward - other.forward).abs() > threshold ||
+           (lateral - other.lateral).abs() > threshold;
+  }
+
+  @override
+  String toString() => 'Control(t:${throttle.toStringAsFixed(2)}, y:${yaw.toStringAsFixed(2)}, f:${forward.toStringAsFixed(2)}, l:${lateral.toStringAsFixed(2)})';
+}
 
 class DroneController {
   final Logger log = Logger('DroneController');
-  final Function(String, bool, [double? angle, bool? led, Map<String, dynamic>? gpsData]) onStatusChanged;
-  final StreamController<LatLng> _positionStreamController = StreamController<LatLng>.broadcast();
-  Stream<LatLng> get positionStream => _positionStreamController.stream;
+  
+  // Callbacks
+  final Function(DroneStatus) onStatusChanged;
+  final Function(String message, {bool isError})? onLogMessage;
+  
+  // WebSocket
   IOWebSocketChannel? _channel;
   Timer? _reconnectTimer;
   Timer? _controlTimer;
+  Timer? _heartbeatTimer;
+  Timer? _servoCommandTimer; // Add timer to prevent servo command flooding
+  
+  // Connection state
+  ConnectionState _connectionState = ConnectionState.disconnected;
   int _retries = 0;
-  final int maxRetries = 5;
-  bool _isWebSocketConnected = false;
-  String connectionStatus = 'Disconnected';
-  double _lastThrottle = 0.0;
-  double _lastYaw = 0.0;
-  double _lastForward = 0.0;
-  double _lastLateral = 0.0;
-  double _lastSpeed = 0.0;
+  int _consecutiveFailures = 0;
+  final int maxRetries = 10;
+  final int maxConsecutiveFailures = 5;
+  
+  // Control state
+  ControlValues _lastControl = const ControlValues(throttle: 0, yaw: 0, forward: 0, lateral: 0);
+  double _lastServoAngle = 0.0;
+  double _currentServoAngle = 0.0;
+  bool _currentLedState = false;
+  
+  // Configuration
+  static const Duration controlInterval = Duration(milliseconds: 100);
+  static const Duration heartbeatInterval = Duration(seconds: 30);
+  static const Duration reconnectDelay = Duration(seconds: 3);
+  static const Duration connectTimeout = Duration(seconds: 15);
+  static const Duration servoCommandDelay = Duration(milliseconds: 50); // Delay between servo commands
+  static const double controlThreshold = 0.02;
 
-  DroneController({required this.onStatusChanged});
+  DroneController({
+    required this.onStatusChanged,
+    this.onLogMessage,
+  });
 
-  void _updateStatus(String status, bool connected, [double? angle, bool? led, Map<String, dynamic>? gpsData]) {
-    _isWebSocketConnected = connected;
-    connectionStatus = status;
-    onStatusChanged(status, connected, angle, led, gpsData);
-    log.info('Status updated: $status, Connected: $connected, Angle: $angle, LED: $led, GPS: $gpsData');
+  // Getters
+  bool get isConnected => _connectionState == ConnectionState.connected;
+  ConnectionState get connectionState => _connectionState;
+  double get currentServoAngle => _currentServoAngle;
+  bool get currentLedState => _currentLedState;
+  String get connectionInfo => '${AppConfig.droneIP}:${AppConfig.websocketPort}';
+
+  void _logMessage(String message, {bool isError = false}) {
+    if (isError) {
+      log.severe(message);
+    } else {
+      log.info(message);
+    }
+    onLogMessage?.call(message, isError: isError);
   }
 
-  void _updateDronePosition(double lat, double lon) {
-    if (lat.isFinite && lon.isFinite) {
-      final position = LatLng(lat, lon);
-      _positionStreamController.add(position);
-      log.info('Updated drone position: $position');
-    } else {
-      log.warning('Invalid GPS data: lat=$lat, lon=$lon');
-    }
+  void _updateStatus(ConnectionState state, String message, {double? angle, bool? led}) {
+    _connectionState = state;
+    
+    if (angle != null) _currentServoAngle = angle;
+    if (led != null) _currentLedState = led;
+    
+    final status = DroneStatus(
+      connectionState: state,
+      message: message,
+      servoAngle: _currentServoAngle,
+      ledState: _currentLedState,
+    );
+    
+    _logMessage('Status: $status');
+    onStatusChanged(status);
   }
 
   Future<void> connect() async {
-    if (_isWebSocketConnected) {
-      log.info('Already connected, skipping connect attempt');
+    if (isConnected) {
+      _logMessage('Already connected, skipping connect attempt');
       return;
     }
 
-    _channel?.sink.close();
-    _channel = null;
-    _reconnectTimer?.cancel();
-
-    String trimmedIP = AppConfig.droneIP.trim();
-    log.info('Attempting connection to ws://$trimmedIP:${AppConfig.websocketPort} (Retry $_retries/$maxRetries)');
+    await disconnect();
+    
+    final trimmedIP = AppConfig.droneIP.trim();
+    final uri = 'ws://$trimmedIP:${AppConfig.websocketPort}';
+    
+    _logMessage('Connecting to $uri (Attempt ${_retries + 1}/${maxRetries + 1})');
+    _updateStatus(ConnectionState.connecting, 'Connecting to $connectionInfo...');
+    
     try {
-      _updateStatus('Connecting...', false);
       _channel = IOWebSocketChannel.connect(
-        Uri.parse('ws://$trimmedIP:${AppConfig.websocketPort}'),
-        pingInterval: const Duration(seconds: 5),
-        connectTimeout: const Duration(seconds: 10),
+        Uri.parse(uri),
+        pingInterval: const Duration(seconds: 15),
+        connectTimeout: connectTimeout,
       );
 
-      log.info('Connection initiated');
-
-      _channel!.stream.listen(
-            (data) {
-          log.info('Data received: $data');
-          try {
-            var response = jsonDecode(data);
-            if (response['type'] == 'gps') {
-              final gpsData = response['data'];
-              if (gpsData != null && gpsData['lat'] is num && gpsData['lon'] is num) {
-                _updateDronePosition(gpsData['lat'].toDouble(), gpsData['lon'].toDouble());
-                // 也通過回調傳遞 GPS 數據
-                _updateStatus('Connected', true, null, null, gpsData);
-              } else {
-                log.warning('Invalid GPS data format: $gpsData');
-              }
-            } else if (response['type'] == 'angle_update') {
-              _updateStatus('Connected', true, response['angle']?.toDouble(), response['led']);
-            } else if (response['status'] == 'received' || response['status'] == 'ok') {
-              _updateStatus('Connected', true, response['angle']?.toDouble(), response['led']);
-              _retries = 0; // Reset retries on successful connection
-            } else if (response['status'] == 'error') {
-              _updateStatus('Error: ${response['message']}', true);
-            }
-          } catch (e) {
-            log.severe('Failed to parse message: $e');
-          }
-        },
-        onDone: () {
-          log.warning('WebSocket closed: ${_channel?.closeCode} ${_channel?.closeReason}');
-          _updateStatus('Disconnected', false);
-          _scheduleReconnect();
-        },
-        onError: (error, stackTrace) {
-          log.severe('WebSocket stream error: $error', error, stackTrace);
-          _updateStatus('Error: WebSocket stream error: $error', false);
-          _scheduleReconnect();
-        },
-        cancelOnError: true,
-      );
-
-      await Future.delayed(const Duration(milliseconds: 500));
-      if (_channel != null && connectionStatus == 'Connecting...') {
-        _updateStatus('Connected', true);
+      _setupWebSocketListeners();
+      
+      // Wait a bit longer to see if connection establishes
+      await Future.delayed(const Duration(milliseconds: 1500));
+      
+      if (_connectionState == ConnectionState.connecting) {
+        _updateStatus(ConnectionState.connected, 'Connected to $connectionInfo');
+        _retries = 0;
+        _consecutiveFailures = 0;
+        _startHeartbeat();
+        
+        // Request initial status
+        _requestStatus();
       }
+      
     } catch (e, stackTrace) {
-      log.severe('WebSocket connect error: $e', e, stackTrace);
-      _updateStatus('Error: Failed to connect to WebSocket: $e', false);
-      _scheduleReconnect();
+      _logMessage('Connection failed: $e', isError: true);
+      log.severe('Connection error details', e, stackTrace);
+      _handleConnectionError('Failed to connect: $e');
     }
   }
 
-  void _scheduleReconnect() {
-    if (_retries >= maxRetries) {
-      _updateStatus('Error: Max retries reached', false);
-      log.severe('Max reconnection retries reached');
-      return;
-    }
-    _retries++;
-    log.info('Scheduling reconnect attempt in 5 seconds');
-    _reconnectTimer = Timer(const Duration(seconds: 5), connect);
+  void _setupWebSocketListeners() {
+    _channel!.stream.listen(
+      _handleWebSocketMessage,
+      onDone: _handleWebSocketClosed,
+      onError: _handleWebSocketError,
+      cancelOnError: false,
+    );
   }
 
-  void sendCommand(String action) {
-    if (!_isWebSocketConnected || _channel == null) {
-      log.warning('Cannot send command: WebSocket not connected');
-      return;
+  void _handleWebSocketMessage(dynamic data) {
+    try {
+      final response = jsonDecode(data.toString());
+      _logMessage('Received: $response');
+      
+      // Reset consecutive failures on successful message
+      _consecutiveFailures = 0;
+      
+      final status = response['status'];
+      final message = response['message'];
+      final angle = response['angle']?.toDouble();
+      final led = response['led'];
+      
+      switch (status) {
+        case 'received':
+        case 'ok':
+          if (_connectionState != ConnectionState.connected) {
+            _updateStatus(ConnectionState.connected, 'Connected and operational');
+          }
+          // Always update LED state if it's present (even if null)
+          if (angle != null || led != null) {
+            _updateStatus(_connectionState, 'Status updated', angle: angle, led: led);
+          } else if (angle != null || led != null || (angle == null && led == null)) {
+            // If we have any status update, update the status
+            _updateStatus(_connectionState, 'Status updated', angle: angle, led: led);
+          }
+          break;
+          
+        case 'error':
+          // Don't treat command errors as critical connection errors
+          if (message != null && (message.contains('status_request') || message.contains('未知消息類型'))) {
+            _logMessage('Status request not supported by server (this is OK)', isError: false);
+          } else if (message != null && message.contains('REQUEST_SERVO_ANGLE')) {
+            _logMessage('REQUEST_SERVO_ANGLE command not supported (this is OK)', isError: false);
+          } else if (message != null && message.contains('led_control')) {
+            _logMessage('LED command format error (this is OK)', isError: false);
+          } else {
+            _logMessage('Server error: $message', isError: true);
+            // Don't immediately disconnect on server errors, just log them
+            // _updateStatus(ConnectionState.error, 'Server error: $message');
+          }
+          // Even on error, update LED state if provided
+          if (led != null) {
+            _updateStatus(_connectionState, 'Status updated with error', angle: angle, led: led);
+          }
+          break;
+          
+        default:
+          _logMessage('Unknown response status: $status');
+          break;
+      }
+      
+    } catch (e) {
+      _logMessage('Failed to parse server response: $e', isError: true);
     }
+  }
 
-    Map<String, dynamic> message;
-    if (action == 'ARM' || action == 'DISARM') {
-      message = {
-        'type': 'arm',
-        'arm': action == 'ARM',
-      };
+  void _handleWebSocketClosed() {
+    final closeCode = _channel?.closeCode;
+    final closeReason = _channel?.closeReason;
+    _logMessage('WebSocket closed: $closeCode $closeReason');
+    
+    _stopHeartbeat();
+    _updateStatus(ConnectionState.disconnected, 'Connection closed');
+    
+    // Don't auto-reconnect if it was a clean close (1000)
+    if (closeCode != 1000) {
+      _scheduleReconnect('Connection closed unexpectedly with code $closeCode: $closeReason');
+    }
+  }
+
+  void _handleWebSocketError(error, stackTrace) {
+    _consecutiveFailures++;
+    _logMessage('WebSocket error: $error', isError: true);
+    log.severe('WebSocket error details', error, stackTrace);
+    
+    _stopHeartbeat();
+    
+    // Don't immediately mark as error for minor issues
+    if (_consecutiveFailures < maxConsecutiveFailures) {
+      _logMessage('Minor WebSocket error, will retry...', isError: false);
+      _scheduleReconnect('WebSocket error: $error');
     } else {
-      message = {
-        'type': 'command',
-        'action': action,
-      };
+      _handleConnectionError('Connection error: $error');
     }
-
-    final messageString = jsonEncode(message);
-    _channel!.sink.add(messageString);
-    log.info('Sent command: $messageString');
   }
 
-  void sendLedCommand(String action) {
-    if (!_isWebSocketConnected || _channel == null) {
-      log.warning('Cannot send LED command: WebSocket not connected');
+  void _handleConnectionError(String error) {
+    _consecutiveFailures++;
+    _logMessage('Connection error ($_consecutiveFailures consecutive): $error', isError: _consecutiveFailures >= 3);
+    
+    // Only mark as error state after multiple consecutive failures
+    if (_consecutiveFailures >= 3) {
+      _updateStatus(ConnectionState.error, error);
+    }
+    
+    if (_consecutiveFailures >= maxConsecutiveFailures) {
+      _logMessage('Too many consecutive failures, extending retry delay', isError: true);
+    }
+    
+    _scheduleReconnect(error);
+  }
+
+  void _scheduleReconnect(String reason) {
+    if (_retries >= maxRetries) {
+      _updateStatus(ConnectionState.error, 'Max retry attempts reached. Manual reconnection required.');
       return;
     }
-    final message = jsonEncode({'type': 'led_control', 'action': action});
-    _channel!.sink.add(message);
-    log.info('Sent LED command: $message');
+    
+    _retries++;
+    _updateStatus(ConnectionState.reconnecting, 'Reconnecting in ${reconnectDelay.inSeconds}s... ($reason)');
+    
+    // Gradually increase delay based on consecutive failures and retries
+    Duration delay;
+    if (_consecutiveFailures >= maxConsecutiveFailures) {
+      delay = Duration(seconds: reconnectDelay.inSeconds * 3);
+    } else if (_consecutiveFailures >= maxConsecutiveFailures ~/ 2) {
+      delay = Duration(seconds: reconnectDelay.inSeconds * 2);
+    } else if (_retries > maxRetries ~/ 2) {
+      delay = Duration(seconds: reconnectDelay.inSeconds * 2);
+    } else {
+      delay = reconnectDelay;
+    }
+    
+    // Add some jitter to prevent thundering herd
+    final jitter = Duration(milliseconds: (delay.inMilliseconds * (0.1 * (math.Random().nextDouble() - 0.5))).toInt());
+    final finalDelay = delay + jitter;
+    
+    _reconnectTimer = Timer(finalDelay, connect);
   }
 
-  void sendServoSpeed(double speed) {
-    if (!_isWebSocketConnected || _channel == null) {
-      log.warning('Cannot send servo speed: WebSocket not connected');
-      return;
-    }
-    if ((speed - _lastSpeed).abs() > 0.01) {
-      final message = jsonEncode({'type': 'servo_speed', 'speed': speed.clamp(-1.0, 1.0)});
-      _channel!.sink.add(message);
-      log.info('Sent servo speed: ${(speed * 100).toStringAsFixed(1)}%');
-      _lastSpeed = speed;
-    }
-  }
-
-  void sendServoAngle(double angle) {
-    if (!_isWebSocketConnected || _channel == null) {
-      log.warning('Cannot send servo angle: WebSocket not connected');
-      return;
-    }
-    final message = jsonEncode({'type': 'servo_control', 'angle': angle.clamp(-45.0, 90.0)});
-    _channel!.sink.add(message);
-    log.info('Sent servo angle: ${angle.toStringAsFixed(1)}°');
-  }
-
-  void requestServoAngle() {
-    if (!_isWebSocketConnected || _channel == null) {
-      log.warning('Cannot request servo angle: WebSocket not connected');
-      return;
-    }
-    final message = jsonEncode({'type': 'request_angle'});
-    _channel!.sink.add(message);
-    log.info('Requested servo angle');
-  }
-
-  void startSendingControl(double throttle, double yaw, double forward, double lateral) {
-    _controlTimer?.cancel();
-    _controlTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) {
-      if (!_isWebSocketConnected || _channel == null) {
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(heartbeatInterval, (timer) {
+      if (!isConnected) {
         timer.cancel();
-        log.warning('Control timer cancelled: WebSocket not connected');
         return;
       }
-      const threshold = 0.05;
-      if ((throttle - _lastThrottle).abs() > threshold ||
-          (yaw - _lastYaw).abs() > threshold ||
-          (forward - _lastForward).abs() > threshold ||
-          (lateral - _lastLateral).abs() > threshold) {
-        final message = jsonEncode({
-          'type': 'control',
-          'throttle': throttle.clamp(-1.0, 1.0),
-          'yaw': yaw.clamp(-1.0, 1.0),
-          'forward': forward.clamp(-1.0, 1.0),
-          'lateral': lateral.clamp(-1.0, 1.0),
-        });
-        _channel!.sink.add(message);
-        log.info('Sent control: $message');
-        _lastThrottle = throttle;
-        _lastYaw = yaw;
-        _lastForward = forward;
-        _lastLateral = lateral;
-      }
+      _requestStatus();
     });
   }
 
-  void stopSendingControl() {
-    _controlTimer?.cancel();
-    log.info('Stopped sending control commands');
+  void _stopHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
   }
 
-  void disconnect() {
-    _reconnectTimer?.cancel();
+  void _requestStatus() {
+    _sendMessage({
+      'type': 'status_request',
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    }, logMessage: false);
+  }
+
+  bool _sendMessage(Map<String, dynamic> message, {bool logMessage = true}) {
+    if (!isConnected || _channel == null) {
+      if (logMessage) {
+        _logMessage('Cannot send message: not connected', isError: true);
+      }
+      return false;
+    }
+
+    try {
+      final jsonMessage = jsonEncode(message);
+      _channel!.sink.add(jsonMessage);
+      
+      if (logMessage) {
+        _logMessage('Sent: $message');
+      }
+      return true;
+    } catch (e) {
+      _logMessage('Failed to send message: $e', isError: true);
+      return false;
+    }
+  }
+
+  // Public control methods
+  bool sendCommand(String action) {
+    return _sendMessage({
+      'type': 'command',
+      'action': action,
+    });
+  }
+
+  bool sendLedCommand(String action) {
+    return _sendMessage({
+      'type': 'command',
+      'action': action,
+    });
+  }
+
+  bool sendServoAngle(double angle) {
+    final clampedAngle = angle.clamp(-45.0, 90.0);
+    // Increase threshold to reduce unnecessary updates and jitter
+    if ((clampedAngle - _lastServoAngle).abs() < 1.0) {
+      return true; // Skip if change is too small
+    }
+    
+    // Prevent flooding servo commands
+    if (_servoCommandTimer?.isActive ?? false) {
+      return false; // Skip if we're still waiting from previous command
+    }
+    
+    _lastServoAngle = clampedAngle;
+    final result = _sendMessage({
+      'type': 'servo_control',
+      'angle': clampedAngle,
+    });
+    
+    // Set timer to prevent next command until delay has passed
+    _servoCommandTimer = Timer(servoCommandDelay, () {});
+    
+    return result;
+  }
+
+  bool sendServoSpeed(double speed) {
+    // Convert speed to angle change
+    final angleChange = speed * 2.0; // Adjust multiplier as needed
+    final newAngle = (_currentServoAngle + angleChange).clamp(-45.0, 90.0);
+    return sendServoAngle(newAngle);
+  }
+
+  void startContinuousControl(double throttle, double yaw, double forward, double lateral) {
+    final control = ControlValues(
+      throttle: throttle,
+      yaw: yaw,
+      forward: forward,
+      lateral: lateral,
+    ).clamp();
+
+    if (_controlTimer == null) {
+      // Start new control timer
+      _controlTimer = Timer.periodic(controlInterval, (timer) {
+        _sendControlUpdate();
+      });
+    }
+
+    // Update control values if they've changed significantly
+    if (control.differenceExceeds(_lastControl, controlThreshold)) {
+      _lastControl = control;
+    }
+  }
+
+  void _sendControlUpdate() {
+    if (!isConnected) {
+      stopContinuousControl();
+      return;
+    }
+
+    _sendMessage({
+      'type': 'control',
+      'throttle': _lastControl.throttle,
+      'yaw': _lastControl.yaw,
+      'forward': _lastControl.forward,
+      'lateral': _lastControl.lateral,
+    }, logMessage: false);
+  }
+
+  void stopContinuousControl() {
     _controlTimer?.cancel();
-    _channel?.sink.close();
-    _channel = null;
-    _retries = 0;
-    _updateStatus('Disconnected', false);
-    log.info('Disconnected from WebSocket');
+    _controlTimer = null;
+    
+    // Send neutral control values
+    if (isConnected) {
+      _sendMessage({
+        'type': 'control',
+        'throttle': 0.0,
+        'yaw': 0.0,
+        'forward': 0.0,
+        'lateral': 0.0,
+      });
+    }
+    
+    _lastControl = const ControlValues(throttle: 0, yaw: 0, forward: 0, lateral: 0);
+  }
+
+  // Emergency stop
+  void emergencyStop() {
+    stopContinuousControl();
+    sendCommand('DISARM');
+    _logMessage('EMERGENCY STOP ACTIVATED', isError: true);
   }
 
   void dispose() {
+    _logMessage('Disposing DroneController...');
     disconnect();
-    _positionStreamController.close();
-    log.info('DroneController disposed');
+    _servoCommandTimer?.cancel(); // Cancel servo command timer
+  }
+
+  Future<void> disconnect() async {
+    _logMessage('Disconnecting...');
+    
+    // Cancel all timers
+    _reconnectTimer?.cancel();
+    _controlTimer?.cancel();
+    _heartbeatTimer?.cancel();
+    _servoCommandTimer?.cancel(); // Cancel servo command timer
+    
+    // Close WebSocket
+    if (_channel != null) {
+      try {
+        await _channel!.sink.close(1000, 'Normal closure');
+      } catch (e) {
+        _logMessage('Error during disconnect: $e');
+      }
+      _channel = null;
+    }
+    
+    // Reset state
+    _retries = 0;
+    _consecutiveFailures = 0;
+    _lastControl = const ControlValues(throttle: 0, yaw: 0, forward: 0, lateral: 0);
+    
+    _updateStatus(ConnectionState.disconnected, 'Disconnected');
+  }
+
+  void resetConnection() {
+    _retries = 0;
+    _consecutiveFailures = 0;
+    connect();
+  }
+
+  // Utility methods
+  String getConnectionSummary() {
+    return '''
+Connection: $connectionInfo
+State: $_connectionState
+Retries: $_retries/$maxRetries
+Consecutive Failures: $_consecutiveFailures
+Servo Angle: ${_currentServoAngle.toStringAsFixed(1)}°
+LED State: ${_currentLedState ? 'ON' : 'OFF'}
+''';
   }
 }

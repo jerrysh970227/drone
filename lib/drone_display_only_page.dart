@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'package:http/http.dart' as http;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:logging/logging.dart';
@@ -54,24 +55,28 @@ class _DroneDisplayOnlyPageState extends State<DroneDisplayOnlyPage> with Ticker
     _pulseController.repeat(reverse: true);
 
     _controller = DroneController(
-      onStatusChanged: (status, connected, [angle, led, gpsData]) {
+      onStatusChanged: (DroneStatus status) {
         setState(() {
-          isWebSocketConnected = connected;
-          log.info('WebSocket 狀態: $status, 連線: $connected');
-          if (angle != null && angle >= -45.0 && angle <= 135.0) {
-            _servoAngle = angle;
-            servoSpeed = (angle + 45) / 180; // 將角度映射到速度 [-45°~135°] -> [0~1]
+          isWebSocketConnected = status.isConnected;
+          log.info('WebSocket 狀態: ${status.connectionState}, 連線: ${status.isConnected}');
+          if (status.servoAngle != null && status.servoAngle! >= -45.0 && status.servoAngle! <= 135.0) {
+            _servoAngle = status.servoAngle;
+            servoSpeed = (status.servoAngle! + 45) / 180; // 將角度映射到速度 [-45°~135°] -> [0~1]
             log.info('伺服器回傳角度更新: ${_servoAngle?.toStringAsFixed(1)}°');
           }
-          if (led != null) {
-            _ledEnabled = led;
+          if (status.ledState != null) {
+            _ledEnabled = status.ledState!;
             log.info('LED 狀態更新: $_ledEnabled');
           }
           // GPS 數據處理（如果需要的話）
-          if (gpsData != null) {
-            log.info('GPS 數據接收: $gpsData');
-          }
+          // Note: GPS data is not part of DroneStatus in the current implementation
         });
+      },
+      onLogMessage: (String message, {bool isError = false}) {
+        log.info('控制器訊息: $message');
+        if (isError) {
+          log.severe('控制器錯誤: $message');
+        }
       },
     );
     _controller.connect();
@@ -247,12 +252,14 @@ class _DroneDisplayOnlyPageState extends State<DroneDisplayOnlyPage> with Ticker
 
   void _updateServoAngle(double newAngle) {
     _debounceTimer?.cancel();
-    _debounceTimer = Timer(const Duration(milliseconds: 20), () {
+    // Increase debounce time and threshold to reduce jitter
+    _debounceTimer = Timer(const Duration(milliseconds: 50), () {
       setState(() {
-        final clampedAngle = newAngle.clamp(-45.0, 135.0); // 與 DroneController 的範圍一致
-        if ((clampedAngle - (_servoAngle ?? 0.0)).abs() > 0.1) {
+        final clampedAngle = newAngle.clamp(-45.0, 90.0); // Fix angle range to match controller
+        // Increase threshold to reduce unnecessary updates
+        if ((clampedAngle - (_servoAngle ?? 0.0)).abs() > 1.0) {
           _servoAngle = clampedAngle;
-          servoSpeed = (_servoAngle! + 45) / 180; // 將角度映射到速度
+          servoSpeed = (_servoAngle! + 45) / 135; // Update speed calculation
           if (isWebSocketConnected) {
             _controller.sendServoAngle(_servoAngle!);
             log.info('更新伺服角度: ${_servoAngle!.toStringAsFixed(1)}°');
