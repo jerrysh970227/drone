@@ -15,7 +15,6 @@ import 'package:logging/logging.dart';
 import 'drone_controller.dart';
 import 'constants.dart';
 import 'Photo_mode_setting.dart';
-import 'drone_display_only_page.dart';
 import 'main.dart';
 
 class DroneJoystickPage extends StatefulWidget {
@@ -31,6 +30,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
   bool _aiRecognitionEnabled = false;
   bool _aiRescueEnabled = false;
   bool _ledEnabled = false;
+  bool _auxiliaryLine = false;
   bool _useSliderControl = false; // 控制伺服馬達方式（false: 按鈕控制, true: 滑桿）
   bool _usePhoneAsMapCenter = false; // 控制地圖中心顯示（false: 無人機位置, true: 手機位置）
   final Logger log = Logger('DroneJoystickPage');
@@ -74,9 +74,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
 
   List<int> _buffer = [];
   Socket? _socket;
-  bool _isVideoConnect = false;
   StreamSubscription? _socketSubscription;
-  Timer? _reconnectTimer;
 
   @override
   void initState() {
@@ -1156,6 +1154,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
     );
   }
 
+  //flutter 援備地圖
   Widget _buildFlutterMapFallback() {
     log.info('使用 FlutterMap 作為地圖備援');
     // 根據設置決定地圖中心位置
@@ -1431,13 +1430,14 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
     return -1;
   }
 
-  void _changeUIMode(String newMode) {
-    if (selectedMode != newMode) {
-      setState(() {
-        selectedMode = newMode;
-      });
-      log.info('UI模式已切換至：$newMode');
-    }
+  void _changeUIMode(String newMode, StateSetter innerState) {
+    innerState((){
+      selectedMode = newMode;
+    });
+    setState(() {
+      selectedMode = newMode;
+    });
+    log.info('UI模式已切換至：$newMode');
   }
 
   bool _shouldShowControls() {
@@ -1545,7 +1545,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
                                     ..._buildSettingsUI(
                                       innerContext,
                                       selectedMode,
-                                      _changeUIMode,
                                       innerSetState,
                                     ),
                                   if (selectedMenu == '資訊')
@@ -1635,7 +1634,6 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
   List<Widget> _buildSettingsUI(
     BuildContext context,
     final String selectedMode,
-    Function(String) onModeChanged,
     StateSetter innerSetState,
   ) {
     return [
@@ -1658,6 +1656,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
         title: const Text('手勢辨識', style: TextStyle(color: Colors.white)),
         trailing: Switch(
           value: _gestureRecognitionEnabled,
+          activeColor: Colors.green,
           onChanged: (bool value) {
             innerSetState(() {
               _gestureRecognitionEnabled = value;
@@ -1673,6 +1672,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
         title: const Text('AI 辨識', style: TextStyle(color: Colors.white)),
         trailing: Switch(
           value: _aiRecognitionEnabled,
+          activeColor: Colors.green,
           onChanged: (bool value) {
             innerSetState(() {
               _aiRecognitionEnabled = value;
@@ -1688,6 +1688,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
         title: const Text('AI 搜救', style: TextStyle(color: Colors.white)),
         trailing: Switch(
           value: _aiRescueEnabled,
+          activeColor: Colors.green,
           onChanged: (bool value) {
             innerSetState(() {
               _aiRescueEnabled = value;
@@ -1706,6 +1707,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
         ),
         trailing: Switch(
           value: _useSliderControl,
+          activeColor: Colors.green,
           onChanged: (bool value) {
             innerSetState(() {
               _useSliderControl = value;
@@ -1726,6 +1728,7 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
         ),
         trailing: Switch(
           value: _usePhoneAsMapCenter,
+          activeColor: Colors.green,
           onChanged: (bool value) {
             innerSetState(() {
               _usePhoneAsMapCenter = value;
@@ -1733,6 +1736,22 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
             setState(() {
               _usePhoneAsMapCenter = value;
               log.info('地圖中心顯示切換為: ${_usePhoneAsMapCenter ? '手機位置' : '無人機位置'}');
+            });
+          },
+        ),
+      ),
+      ListTile(
+        leading: const Icon(Icons.photo_camera, color: Colors.white),
+        title: const Text('拍照輔助線', style: TextStyle(color: Colors.white)),
+        trailing: Switch(
+          value: _auxiliaryLine,
+          activeColor: Colors.green,
+          onChanged: (bool value) {
+            innerSetState(() {
+              _auxiliaryLine = value;
+            });
+            setState(() {
+              _auxiliaryLine = value;
             });
           },
         ),
@@ -1754,17 +1773,17 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
               _ModeOption(
                 label: '顯示加控制',
                 isSelected: selectedMode == '顯示加控制',
-                onTap: () => onModeChanged('顯示加控制'),
+                onTap: () => _changeUIMode('顯示加控制',innerSetState),
               ),
               _ModeOption(
                 label: '僅顯示',
                 isSelected: selectedMode == '僅顯示',
-                onTap: () => onModeChanged('僅顯示'),
+                onTap: () => _changeUIMode('僅顯示',innerSetState),
               ),
               _ModeOption(
                 label: '協同作業',
                 isSelected: selectedMode == '協同作業',
-                onTap: () => onModeChanged('協同作業'),
+                onTap: () => _changeUIMode('協同作業',innerSetState),
               ),
             ],
           ),
@@ -2617,12 +2636,10 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
             if (_shouldShowServoControls()) _buildServoSlider1(),
 
             _buildTopStatusBar(),
-            Positioned.fill(child:IgnorePointer(
-              child: CustomPaint(
-                painter: _GridPainter(),
+            if(_auxiliaryLine)
+              Positioned.fill(
+                child: IgnorePointer(child: CustomPaint(painter: _GridPainter())),
               ),
-            ) ),
-
             if (_shouldShowControls()) _buildBottomControlArea(),
             Positioned(
               left: 20,
@@ -2812,22 +2829,22 @@ class _DroneJoystickPageState extends State<DroneJoystickPage>
                 ),
               ),
             ),
-            Positioned(
-              right: 20,
-              top: (MediaQuery.of(context).size.height - 60) / 2 - 50,
-              child: IconButton(
-                onPressed: () {
-                  _showRecordingOptionsDialog(context);
-                },
-                icon: const Icon(Icons.movie, color: Colors.white, size: 30),
-                style: IconButton.styleFrom(
-                  backgroundColor: Colors.black.withOpacity(0.3),
-                  shape: const CircleBorder(),
-                  padding: const EdgeInsets.all(10),
-                ),
-                tooltip: '錄影選項',
-              ),
-            ),
+            // Positioned(
+            //   right: 20,
+            //   top: (MediaQuery.of(context).size.height - 60) / 2 - 50,
+            //   child: IconButton(
+            //     onPressed: () {
+            //       _showRecordingOptionsDialog(context);
+            //     },
+            //     icon: const Icon(Icons.movie, color: Colors.white, size: 30),
+            //     style: IconButton.styleFrom(
+            //       backgroundColor: Colors.black.withOpacity(0.3),
+            //       shape: const CircleBorder(),
+            //       padding: const EdgeInsets.all(10),
+            //     ),
+            //     tooltip: '錄影選項',
+            //   ),
+            // ),
             if (isFullScreen)
               Positioned(
                 top: 100,
@@ -3278,27 +3295,19 @@ class _GridPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = Colors.white.withOpacity(0.5) // 半透明白色
-      ..strokeWidth = 2;
+          ..color = Colors.white.withOpacity(0.3) // 半透明白色
+          ..strokeWidth = 1;
 
     // 垂直線 (三等分)
     final dx = size.width / 3;
     for (int i = 1; i < 3; i++) {
-      canvas.drawLine(
-        Offset(dx * i, 0),
-        Offset(dx * i, size.height),
-        paint,
-      );
+      canvas.drawLine(Offset(dx * i, 0), Offset(dx * i, size.height), paint);
     }
 
     // 水平線 (三等分)
     final dy = size.height / 3;
     for (int i = 1; i < 3; i++) {
-      canvas.drawLine(
-        Offset(0, dy * i),
-        Offset(size.width, dy * i),
-        paint,
-      );
+      canvas.drawLine(Offset(0, dy * i), Offset(size.width, dy * i), paint);
     }
   }
 
