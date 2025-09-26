@@ -1,11 +1,10 @@
 import 'dart:ui';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:logging/logging.dart';
 import 'package:lottie/lottie.dart';
+import '../map/maps.dart';
 import 'drone_joystick_page.dart';
-import 'maps.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();

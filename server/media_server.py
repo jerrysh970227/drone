@@ -1,14 +1,19 @@
 import os
 import sys
 import time
+import json
 import signal
 import logging
 import threading
 import subprocess
+import asyncio
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
-from flask import Flask, jsonify, request, send_file, abort
+from flask import Flask, send_file, abort
+from flask_socketio import SocketIO, emit
+import eventlet
+eventlet.monkey_patch()
 
 
 # 日誌設定
@@ -36,8 +41,11 @@ current_media_root = None
 current_photos_dir = None
 current_videos_dir = None
 
+# WebSocket 連接管理
+connected_clients = set()
 
-# USB 掛載相關
+
+# USB 掛載相關函數（保持不變）
 def is_usb_mounted() -> bool:
     try:
         result = subprocess.run(["mount"], capture_output=True, text=True, check=False)
@@ -85,13 +93,11 @@ def unmount_usb() -> bool:
 def get_storage_paths() -> Tuple[str, str, str]:
     """獲取當前存储路徑（優先 USB，其次本地）"""
     if is_usb_mounted():
-        # 使用 USB 存储 - 統一存到 Movies 目錄
         media_root = os.path.join(USB_MOUNT_POINT, "Movies")
-        photos_dir = media_root  # 照片和影片都存在 Movies 目錄
+        photos_dir = media_root
         videos_dir = media_root
-        
+
         try:
-            # 嘗試創建目錄，如果權限不足則使用本地存储
             os.makedirs(media_root, exist_ok=True)
             logger.info(f"✅ 使用 USB 存储: {media_root}")
             return media_root, photos_dir, videos_dir
@@ -99,12 +105,11 @@ def get_storage_paths() -> Tuple[str, str, str]:
             logger.warning(f"⚠️ USB 存储權限不足，切換到本地存储")
         except Exception as e:
             logger.warning(f"⚠️ USB 存储初始化失敗: {e}，切換到本地存储")
-    
-    # 使用本地存储
+
     media_root = os.path.join(BASE_DIR, "media")
     photos_dir = os.path.join(media_root, "photos")
     videos_dir = os.path.join(media_root, "videos")
-    
+
     os.makedirs(photos_dir, exist_ok=True)
     os.makedirs(videos_dir, exist_ok=True)
     logger.info(f"📁 使用本地存储: {media_root}")
@@ -140,7 +145,7 @@ def cleanup_resources():
     logger.info("✅ 資源清理完成")
 
 
-# 其它輔助方法（省略變更，跟你原來一樣） -------------------------------
+# 輔助函數
 def which(cmd: str) -> Optional[str]:
     try:
         import shutil
@@ -182,68 +187,86 @@ def detect_backends() -> Tuple[bool, bool, bool]:
 HAS_LIBCAMERA, HAS_FFMPEG, HAS_PICAMERA2 = detect_backends()
 
 
-# 照片錄影邏輯（與你原本相同，只是輸出路徑會改到 Movies）
 def _timestamped_filename(prefix: str, ext: str) -> str:
     return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
+
+
+# WebSocket 廣播函數
+def broadcast_to_clients(event: str, data: Dict[str, Any]):
+    """廣播消息給所有連接的客戶端"""
+    if connected_clients:
+        socketio.emit(event, data)
+        logger.debug(f"廣播事件 {event} 給 {len(connected_clients)} 個客戶端")
 
 
 def capture_photo(output_path: Optional[str] = None) -> str:
     if output_path is None:
         output_path = os.path.join(current_photos_dir, _timestamped_filename("photo", "jpg"))
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
-    # 優先使用 picamera2
-    if HAS_PICAMERA2:
+
+    # 廣播拍照開始
+    broadcast_to_clients('photo_start', {'output_path': output_path})
+
+    try:
+        # 優先使用 picamera2
+        if HAS_PICAMERA2:
+            try:
+                from picamera2 import Picamera2
+                import time
+
+                logger.info("picamera2 拍照: %s", output_path)
+                picam2 = Picamera2()
+                photo_config = picam2.create_still_configuration(main={"size": (DEFAULT_WIDTH, DEFAULT_HEIGHT)})
+                picam2.configure(photo_config)
+                picam2.start()
+                time.sleep(0.8)
+                picam2.capture_file(output_path)
+                picam2.stop()
+                logger.info("✅ picamera2 拍照成功: %s", output_path)
+                broadcast_to_clients('photo_success', {'file': output_path})
+                return output_path
+            except Exception as exc:
+                logger.warning("picamera2 拍照失敗，嘗試其他方法: %s", exc)
+
+        if HAS_LIBCAMERA:
+            cmd = ["libcamera-still", "-n", "-o", output_path, "--width", str(DEFAULT_WIDTH), "--height", str(DEFAULT_HEIGHT)]
+            logger.info("libcamera 拍照: %s", " ".join(map(str, cmd)))
+            subprocess.check_call(cmd)
+            broadcast_to_clients('photo_success', {'file': output_path})
+            return output_path
+
+        if HAS_FFMPEG:
+            cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "v4l2",
+                   "-video_size", f"{DEFAULT_WIDTH}x{DEFAULT_HEIGHT}", "-i", DEFAULT_DEVICE,
+                   "-vframes", "1", "-pix_fmt", "yuvj420p", output_path]
+            logger.info("ffmpeg 拍照: %s", " ".join(map(str, cmd)))
+            subprocess.check_call(cmd)
+            broadcast_to_clients('photo_success', {'file': output_path})
+            return output_path
+
+        # Fallback to OpenCV
         try:
-            from picamera2 import Picamera2
-            import time
-            
-            logger.info("picamera2 拍照: %s", output_path)
-            picam2 = Picamera2()
-            photo_config = picam2.create_still_configuration(main={"size": (DEFAULT_WIDTH, DEFAULT_HEIGHT)})
-            picam2.configure(photo_config)
-            picam2.start()
-            time.sleep(0.8)  # 減少相機穩定等待時間，但確保足夠穩定
-            picam2.capture_file(output_path)
-            picam2.stop()
-            logger.info("✅ picamera2 拍照成功: %s", output_path)
+            import cv2
+            logger.info("OpenCV 拍照")
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, DEFAULT_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DEFAULT_HEIGHT)
+            for _ in range(3):
+                cap.read()
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                raise RuntimeError("Failed to capture frame")
+            cv2.imwrite(output_path, frame)
+            broadcast_to_clients('photo_success', {'file': output_path})
             return output_path
         except Exception as exc:
-            logger.warning("picamera2 拍照失敗，嘗試其他方法: %s", exc)
-    
-    if HAS_LIBCAMERA:
-        cmd = ["libcamera-still", "-n", "-o", output_path, "--width", str(DEFAULT_WIDTH), "--height", str(DEFAULT_HEIGHT)]
-        logger.info("libcamera 拍照: %s", " ".join(map(str, cmd)))
-        subprocess.check_call(cmd)
-        return output_path
-    
-    if HAS_FFMPEG:
-        # 使用更通用的格式來避免 MJPEG 格式問題
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "v4l2",
-               "-video_size", f"{DEFAULT_WIDTH}x{DEFAULT_HEIGHT}", "-i", DEFAULT_DEVICE, 
-               "-vframes", "1", "-pix_fmt", "yuvj420p", output_path]
-        logger.info("ffmpeg 拍照: %s", " ".join(map(str, cmd)))
-        subprocess.check_call(cmd)
-        return output_path
-    
-    # Fallback to OpenCV
-    try:
-        import cv2
-        logger.info("OpenCV 拍照")
-        cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, DEFAULT_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DEFAULT_HEIGHT)
-        for _ in range(3):
-            cap.read()
-        ret, frame = cap.read()
-        cap.release()
-        if not ret:
-            raise RuntimeError("Failed to capture frame")
-        cv2.imwrite(output_path, frame)
-        return output_path
-    except Exception as exc:
-        logger.exception("OpenCV 拍照失敗")
-        raise RuntimeError("沒有可用的拍照後端") from exc
+            logger.exception("OpenCV 拍照失敗")
+            raise RuntimeError("沒有可用的拍照後端") from exc
+
+    except Exception as e:
+        broadcast_to_clients('photo_error', {'error': str(e)})
+        raise
 
 
 class VideoRecorder:
@@ -258,6 +281,8 @@ class VideoRecorder:
         self._picam2 = None
         self._encoder = None
         self._output = None
+        self._status_thread: Optional[threading.Thread] = None
+        self._stop_status_updates = False
 
     def is_recording(self) -> bool:
         with self._lock:
@@ -267,39 +292,58 @@ class VideoRecorder:
 
     def status(self) -> dict:
         with self._lock:
+            duration = None
+            if self._start_time and self.is_recording():
+                duration = time.time() - self._start_time
+
             return {
                 "recording": self.is_recording(),
                 "started_at": self._start_time,
+                "duration": duration,
                 "raw_file": self._raw_file_path,
                 "file": self._final_file_path or self._raw_file_path,
                 "backend": "picamera2" if self._using_picamera2 else ("libcamera" if self._using_libcamera else ("ffmpeg" if HAS_FFMPEG else "opencv")),
             }
 
+    def _status_updater(self):
+        """定期廣播錄影狀態"""
+        while not self._stop_status_updates and self.is_recording():
+            status = self.status()
+            broadcast_to_clients('video_status', status)
+            time.sleep(1)  # 每秒更新一次狀態
+
     def start(self, output_basename: Optional[str] = None, duration_seconds: Optional[int] = None) -> str:
         with self._lock:
             if self.is_recording():
                 raise RuntimeError("Recording already in progress")
+
             base_name = output_basename or _timestamped_filename("video", "mp4")
             base_name = os.path.splitext(base_name)[0]
             output_mp4 = os.path.join(current_videos_dir, f"{base_name}.mp4")
             os.makedirs(os.path.dirname(output_mp4), exist_ok=True)
-            
+
+            # 廣播錄影開始
+            broadcast_to_clients('video_start', {
+                'file': output_mp4,
+                'duration_seconds': duration_seconds
+            })
+
             # 優先使用 picamera2
             if HAS_PICAMERA2:
                 try:
                     from picamera2 import Picamera2, encoders, outputs
                     import time
-                    
+
                     raw_h264 = os.path.join(current_videos_dir, f"{base_name}.h264")
                     logger.info("picamera2 開始錄影: %s", raw_h264)
-                    
+
                     self._picam2 = Picamera2()
                     video_config = self._picam2.create_video_configuration(main={"size": (DEFAULT_WIDTH, DEFAULT_HEIGHT)})
                     self._picam2.configure(video_config)
-                    
+
                     encoder = encoders.H264Encoder()
                     output = outputs.FileOutput(raw_h264)
-                    
+
                     self._picam2.start_recording(encoder, output)
                     self._encoder = encoder
                     self._output = output
@@ -308,15 +352,21 @@ class VideoRecorder:
                     self._raw_file_path = raw_h264
                     self._final_file_path = output_mp4 if HAS_FFMPEG else None
                     self._start_time = time.time()
-                    
+
                     if duration_seconds:
                         threading.Thread(target=self._auto_stop_after, args=(duration_seconds,), daemon=True).start()
-                    
+
+                    # 開始狀態更新線程
+                    self._stop_status_updates = False
+                    self._status_thread = threading.Thread(target=self._status_updater, daemon=True)
+                    self._status_thread.start()
+
                     return self._final_file_path or self._raw_file_path or output_mp4
-                    
+
                 except Exception as exc:
                     logger.warning("picamera2 錄影失敗，嘗試其他方法: %s", exc)
-            
+                    broadcast_to_clients('video_error', {'error': f'picamera2 錄影失敗: {exc}'})
+
             if HAS_LIBCAMERA:
                 raw_h264 = os.path.join(current_videos_dir, f"{base_name}.h264")
                 cmd = ["libcamera-vid", "-n", "--framerate", str(DEFAULT_FPS),
@@ -342,11 +392,19 @@ class VideoRecorder:
                 self._raw_file_path = output_mp4
                 self._final_file_path = output_mp4
             else:
-                raise RuntimeError("No available backend for video recording")
-            
+                error_msg = "No available backend for video recording"
+                broadcast_to_clients('video_error', {'error': error_msg})
+                raise RuntimeError(error_msg)
+
             self._start_time = time.time()
-            if duration_seconds and not hasattr(self, '_using_picamera2'):
+            if duration_seconds and not self._using_picamera2:
                 threading.Thread(target=self._auto_stop_after, args=(duration_seconds,), daemon=True).start()
+
+            # 開始狀態更新線程
+            self._stop_status_updates = False
+            self._status_thread = threading.Thread(target=self._status_updater, daemon=True)
+            self._status_thread.start()
+
             return self._final_file_path or self._raw_file_path or output_mp4
 
     def _auto_stop_after(self, duration_seconds: int) -> None:
@@ -357,10 +415,17 @@ class VideoRecorder:
             pass
 
     def stop(self) -> str:
+        self._stop_status_updates = True  # 停止狀態更新
+
         with self._lock:
             if not self.is_recording():
-                raise RuntimeError("No active recording")
-            
+                error_msg = "No active recording"
+                broadcast_to_clients('video_error', {'error': error_msg})
+                raise RuntimeError(error_msg)
+
+            # 廣播錄影停止開始
+            broadcast_to_clients('video_stopping', {})
+
             # 處理 picamera2 錄影
             if self._using_picamera2 and self._picam2:
                 try:
@@ -371,7 +436,6 @@ class VideoRecorder:
                     logger.info("✅ picamera2 錄影已停止")
                 except Exception as e:
                     logger.warning(f"picamera2 停止錯誤: {e}")
-                    # 嘗試強制關閉資源
                     try:
                         if self._output and hasattr(self._output, 'close'):
                             self._output.close()
@@ -382,43 +446,42 @@ class VideoRecorder:
                     self._encoder = None
                     self._output = None
                     self._using_picamera2 = False
-            
+
             # 處理其他錄影方式
             elif self._process:
-                # 嘗試多種方法停止進程
-                for stop_method in [lambda p: p.send_signal(signal.SIGINT), 
-                                   lambda p: p.terminate(), 
+                for stop_method in [lambda p: p.send_signal(signal.SIGINT),
+                                   lambda p: p.terminate(),
                                    lambda p: p.kill()]:
                     try:
                         stop_method(self._process)
-                        # 給進程一點時間來響應信號
                         if self._process.poll() is not None:
                             break
                         time.sleep(0.5)
                     except Exception as e:
                         logger.debug(f"停止進程方法失敗: {e}")
                         continue
-        
-        # 等待進程結束，使用更短的超時時間
+
+        # 等待進程結束
         if self._process:
             try:
                 self._process.wait(timeout=5)
             except Exception:
                 try:
-                    # 最後嘗試強制終止
                     self._process.kill()
                     self._process.wait(timeout=1)
                 except Exception as e:
                     logger.error(f"無法終止錄影進程: {e}")
-        
+
         with self._lock:
-            # 確保文件被正確處理
             try:
                 final_path = self._finalize_file_if_needed()
+                broadcast_to_clients('video_stop_success', {'file': final_path})
             except Exception as e:
-                logger.error(f"處理錄影文件時出錯: {e}")
+                error_msg = f"處理錄影文件時出錯: {e}"
+                logger.error(error_msg)
+                broadcast_to_clients('video_error', {'error': error_msg})
                 final_path = self._raw_file_path or self._final_file_path
-            
+
             self._process = None
             self._start_time = None
             return final_path
@@ -428,6 +491,9 @@ class VideoRecorder:
         if (self._using_libcamera or self._using_picamera2) and self._raw_file_path.endswith(".h264"):
             if HAS_FFMPEG and self._final_file_path:
                 try:
+                    # 廣播轉換開始
+                    broadcast_to_clients('video_converting', {'from': self._raw_file_path, 'to': self._final_file_path})
+
                     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-r", str(DEFAULT_FPS),
                            "-i", self._raw_file_path, "-c", "copy", self._final_file_path]
                     logger.info("ffmpeg 轉換 MP4: %s", " ".join(cmd))
@@ -437,9 +503,13 @@ class VideoRecorder:
                         logger.info("刪除原始 H264 檔案: %s", self._raw_file_path)
                     except Exception:
                         pass
+
+                    broadcast_to_clients('video_convert_success', {'file': self._final_file_path})
                     return self._final_file_path
                 except Exception as e:
-                    logger.warning(f"ffmpeg 轉換失敗: {e}，保留 H264 檔案")
+                    error_msg = f"ffmpeg 轉換失敗: {e}，保留 H264 檔案"
+                    logger.warning(error_msg)
+                    broadcast_to_clients('video_convert_error', {'error': error_msg, 'file': self._raw_file_path})
                     return self._raw_file_path
             else:
                 return self._raw_file_path
@@ -449,65 +519,112 @@ class VideoRecorder:
 
 video_recorder = VideoRecorder()
 
-# HTTP API
+# Flask 和 SocketIO 設置
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True)
 
 
-@app.get("/health")
-def health() -> tuple:
-    return jsonify({
-        "status": "ok", 
-        "libcamera": HAS_LIBCAMERA, 
-        "ffmpeg": HAS_FFMPEG,
-        "picamera2": HAS_PICAMERA2
-    }), 200
+# WebSocket 事件處理
+@socketio.on('connect')
+def handle_connect():
+    connected_clients.add(request.sid)
+    logger.info(f"客戶端已連接: {request.sid}, 總連接數: {len(connected_clients)}")
+
+    # 發送服務器狀態
+    emit('server_status', {
+        'status': 'connected',
+        'backends': {
+            'libcamera': HAS_LIBCAMERA,
+            'ffmpeg': HAS_FFMPEG,
+            'picamera2': HAS_PICAMERA2
+        },
+        'storage': {
+            'usb_mounted': is_usb_mounted(),
+            'current_path': current_media_root
+        }
+    })
+
+    # 發送當前錄影狀態
+    emit('video_status', video_recorder.status())
 
 
-@app.post("/photo")
-def api_photo() -> tuple:
-    filename = request.args.get("filename")
+@socketio.on('disconnect')
+def handle_disconnect():
+    connected_clients.discard(request.sid)
+    logger.info(f"客戶端已斷開: {request.sid}, 剩餘連接數: {len(connected_clients)}")
+
+
+@socketio.on('photo_capture')
+def handle_photo_capture(data):
     try:
+        filename = data.get('filename') if data else None
         if filename:
             safe_name = sanitize_filename(filename, (".jpg", ".jpeg", ".png"))
             output_path = secure_path_join(current_photos_dir, safe_name)
         else:
             output_path = None
+
         output_path = capture_photo(output_path)
-        return jsonify({"status": "ok", "file": output_path}), 200
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 500
+        emit('photo_success', {'file': output_path})
+
+    except Exception as e:
+        error_msg = f"拍照失敗: {str(e)}"
+        logger.error(error_msg)
+        emit('photo_error', {'error': error_msg})
 
 
-@app.post("/video/start")
-def api_video_start() -> tuple:
-    if video_recorder.is_recording():
-        return jsonify({"status": "error", "message": "Recording already in progress"}), 400
-    filename = request.args.get("filename")
-    duration = request.args.get("duration")
-    duration_seconds = int(duration) if duration and duration.isdigit() else None
+@socketio.on('video_start')
+def handle_video_start(data):
     try:
+        if video_recorder.is_recording():
+            emit('video_error', {'error': 'Recording already in progress'})
+            return
+
+        filename = data.get('filename') if data else None
+        duration = data.get('duration') if data else None
+        duration_seconds = int(duration) if duration and str(duration).isdigit() else None
+
         safe_base = os.path.splitext(sanitize_filename(filename, (".mp4", ".h264")))[0] if filename else None
         path = video_recorder.start(output_basename=safe_base, duration_seconds=duration_seconds)
-        return jsonify({"status": "ok", "file": path}), 200
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 500
+
+        emit('video_start_success', {'file': path})
+
+    except Exception as e:
+        error_msg = f"開始錄影失敗: {str(e)}"
+        logger.error(error_msg)
+        emit('video_error', {'error': error_msg})
 
 
-@app.post("/video/stop")
-def api_video_stop() -> tuple:
+@socketio.on('video_stop')
+def handle_video_stop():
     try:
         path = video_recorder.stop()
-        return jsonify({"status": "ok", "file": path}), 200
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 400
+        emit('video_stop_success', {'file': path})
+
+    except Exception as e:
+        error_msg = f"停止錄影失敗: {str(e)}"
+        logger.error(error_msg)
+        emit('video_error', {'error': error_msg})
 
 
-@app.get("/video/status")
-def api_video_status() -> tuple:
-    return jsonify({"status": "ok", **video_recorder.status()}), 200
+@socketio.on('video_status')
+def handle_video_status():
+    emit('video_status', video_recorder.status())
 
 
-@app.get("/media/<path:filename>")
+@socketio.on('storage_status')
+def handle_storage_status():
+    emit('storage_status', {
+        'usb_mounted': is_usb_mounted(),
+        'current_path': current_media_root,
+        'photos_dir': current_photos_dir,
+        'videos_dir': current_videos_dir
+    })
+
+
+# HTTP 路由（用於文件下載）
+@app.route('/media/<path:filename>')
 def get_media(filename: str):
     try:
         path = secure_path_join(current_media_root, filename)
@@ -518,8 +635,20 @@ def get_media(filename: str):
     return send_file(path)
 
 
+@app.route('/health')
+def health():
+    return {
+        "status": "ok",
+        "websocket": True,
+        "libcamera": HAS_LIBCAMERA,
+        "ffmpeg": HAS_FFMPEG,
+        "picamera2": HAS_PICAMERA2
+    }
+
+
 def main() -> None:
     def signal_handler(signum, frame):
+        logger.info("收到終止信號，正在清理...")
         cleanup_resources()
         sys.exit(0)
 
@@ -527,11 +656,14 @@ def main() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        logger.info("🚀 啟動 Media Server...")
+        logger.info("🚀 啟動 WebSocket Media Server...")
         init_storage()
         host = os.environ.get("MEDIA_SERVER_HOST", "0.0.0.0")
         port = int(os.environ.get("MEDIA_SERVER_PORT", "8770"))
-        app.run(host=host, port=port, debug=False, threaded=True)
+
+        logger.info(f"WebSocket 服務器啟動於 ws://{host}:{port}")
+        socketio.run(app, host=host, port=port, debug=False)
+
     except Exception as e:
         logger.error(f"服務啟動失敗: {e}")
     finally:
