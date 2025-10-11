@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
-import 'package:socket_io_client/socket_io_client.dart' as IO; // Add this import
 
 enum RecordingStatus { idle, recording, stopping, error, converting }
 enum ConnectionStatus { disconnected, connecting, connected, reconnecting }
@@ -14,15 +13,16 @@ class VideoRecordingService extends ChangeNotifier {
   DateTime? _startTime;
   Timer? _timer;
   Timer? _reconnectTimer;
+  Timer? _statusTimer; // Timer for periodic status updates
   String _serverIP;
   int _seconds = 0;
   double _recordingDuration = 0.0; // 來自服務器的精確時長
   String? _currentVideoPath;
   String? _lastError;
   List<String> _recordedVideos = [];
-  IO.Socket? _socket;
   Map<String, dynamic>? _serverStatus;
   Map<String, dynamic>? _storageStatus;
+  bool _isRecordingActive = false; // Track if we have an active recording
 
   // Getters
   RecordingStatus get status => _status;
@@ -58,176 +58,172 @@ class VideoRecordingService extends ChangeNotifier {
   }
 
   void _connect() {
-    if (_socket != null) {
-      _disconnect();
+    // 如果已經連線成功，則不重新連線
+    if (isConnected) {
+      debugPrint('HTTP 已連接，跳過連線嘗試');
+      return;
     }
-
+    
+    // For HTTP-based service, we just check if we can reach the server
     _connectionStatus = ConnectionStatus.connecting;
     notifyListeners();
 
+    // Test connection to media server
+    _testConnection().then((success) {
+      if (success) {
+        _connectionStatus = ConnectionStatus.connected;
+        _clearError();
+        _cancelReconnectTimer();
+        // Start periodic status updates
+        _startStatusTimer();
+        notifyListeners();
+        debugPrint('HTTP 連接成功: $_serverIP:8770');
+      } else {
+        _handleConnectionError('無法連接到媒體服務器');
+      }
+    }).catchError((error) {
+      _handleConnectionError('連接失敗: $error');
+    });
+  }
+
+  Future<bool> _testConnection() async {
     try {
-      _socket = IO.io('http://$_serverIP:8770',
-          IO.OptionBuilder()
-              .setTransports(['websocket'])
-              .disableAutoConnect()
-              .setTimeout(10000)
-              .setReconnectionDelay(2000)
-              .setReconnectionDelayMax(10000)
-              .setReconnectionAttempts(5)
-              .build()
-      );
-
-      _setupSocketListeners();
-      _socket!.connect();
-
-      debugPrint('正在連接到 WebSocket: $_serverIP:8770');
+      final url = Uri.parse('http://$_serverIP:8770/health');
+      debugPrint('測試媒體服務器連接: $url');
+      
+      // 添加重试机制
+      int retryCount = 0;
+      const maxRetries = 2;
+      
+      while (retryCount <= maxRetries) {
+        try {
+          final response = await http.get(url).timeout(const Duration(seconds: 20));
+          debugPrint('連接測試回應: ${response.statusCode}');
+          
+          if (response.statusCode == 200) {
+            try {
+              final data = json.decode(response.body);
+              debugPrint('服務器健康狀態: ${data['status']}');
+              return data['status'] == 'ok';
+            } catch (e) {
+              debugPrint('無法解析服務器健康回應: $e');
+              return true; // 能够连接但无法解析响应也算连接成功
+            }
+          } else if (response.statusCode == 404) {
+            // 如果健康检查端点不存在，尝试基本连接
+            debugPrint('健康檢查端點不存在，嘗試基本連接測試');
+            return true;
+          }
+        } on TimeoutException catch (e) {
+          retryCount++;
+          debugPrint('連接測試超時 (第$retryCount次重試): $e');
+          if (retryCount > maxRetries) {
+            throw e;
+          }
+          await Future.delayed(const Duration(seconds: 2));
+        }
+      }
+      return false;
     } catch (e) {
-      _handleConnectionError('連接失敗: $e');
+      debugPrint('連接測試失敗: $e');
+      return false;
     }
   }
 
-  void _setupSocketListeners() {
-    if (_socket == null) return;
-
-    // 連接事件
-    _socket!.onConnect((_) {
-      debugPrint(' WebSocket 已連接');
-      _connectionStatus = ConnectionStatus.connected;
-      _clearError();
-      _cancelReconnectTimer();
-      notifyListeners();
-    });
-
-    _socket!.onDisconnect((_) {
-      debugPrint(' WebSocket 已斷開連接');
-      _connectionStatus = ConnectionStatus.disconnected;
-      _scheduleReconnect();
-      notifyListeners();
-    });
-
-    _socket!.onConnectError((data) {
-      debugPrint(' WebSocket 連接錯誤: $data');
-      _handleConnectionError('連接錯誤: $data');
-    });
-
-    _socket!.onError((data) {
-      debugPrint(' WebSocket 錯誤: $data');
-      _handleError('Socket 錯誤: $data');
-    });
-
-    // 服務器狀態事件
-    _socket!.on('server_status', (data) {
-      debugPrint(' 服務器狀態: $data');
-      _serverStatus = Map<String, dynamic>.from(data);
-      notifyListeners();
-    });
-
-    _socket!.on('storage_status', (data) {
-      debugPrint(' 存儲狀態: $data');
-      _storageStatus = Map<String, dynamic>.from(data);
-      notifyListeners();
-    });
-
-    // 拍照事件
-    _socket!.on('photo_start', (data) {
-      debugPrint(' 拍照開始: $data');
-    });
-
-    _socket!.on('photo_success', (data) {
-      debugPrint(' 拍照成功: $data');
-      // 可以在這裡處理拍照成功的邏輯
-    });
-
-    _socket!.on('photo_error', (data) {
-      debugPrint(' 拍照失敗: $data');
-      _handleError('拍照失敗: ${data['error']}');
-    });
-
-    // 錄影事件
-    _socket!.on('video_start', (data) {
-      debugPrint(' 錄影開始: $data');
-      _status = RecordingStatus.recording;
-      _startTime = DateTime.now();
-      _seconds = 0;
-      _recordingDuration = 0.0;
-      _currentVideoPath = data['file'];
-      _startTimer();
-      notifyListeners();
-    });
-
-    _socket!.on('video_start_success', (data) {
-      debugPrint(' 錄影啟動成功: $data');
-    });
-
-    _socket!.on('video_status', (data) {
-      debugPrint(' 錄影狀態更新: $data');
-      if (data['recording'] == true && data['duration'] != null) {
-        _recordingDuration = (data['duration'] as num).toDouble();
-        if (_status != RecordingStatus.recording) {
-          _status = RecordingStatus.recording;
-          _startTimer();
-        }
-      } else if (data['recording'] == false && _status == RecordingStatus.recording) {
-        _status = RecordingStatus.idle;
-        _stopTimer();
+  void _startStatusTimer() {
+    _statusTimer?.cancel();
+    // Increase interval from 5 to 10 seconds to reduce server load
+    _statusTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
+      if (isConnected) {
+        _updateStatus();
       }
-
-      if (data['file'] != null) {
-        _currentVideoPath = data['file'];
-      }
-
-      notifyListeners();
     });
+  }
 
-    _socket!.on('video_stopping', (data) {
-      debugPrint(' 錄影停止中...');
-      _status = RecordingStatus.stopping;
-      notifyListeners();
-    });
+  void _stopStatusTimer() {
+    _statusTimer?.cancel();
+    _statusTimer = null;
+  }
 
-    _socket!.on('video_stop_success', (data) {
-      debugPrint(' 錄影停止成功: $data');
-      _status = RecordingStatus.idle;
-      _stopTimer();
-
-      if (data['file'] != null) {
-        _currentVideoPath = data['file'];
-        final filename = (data['file'] as String).split('/').last;
-        if (!_recordedVideos.contains(filename)) {
-          _recordedVideos.add(filename);
+  Future<void> _updateStatus() async {
+    try {
+      final url = Uri.parse('http://$_serverIP:8770/video/status');
+      debugPrint('請求錄影狀態: $url');
+      
+      // 添加重试机制
+      int retryCount = 0;
+      const maxRetries = 2;
+      
+      while (retryCount <= maxRetries) {
+        try {
+          // 增加超时到30秒
+          final response = await http.get(url).timeout(const Duration(seconds: 30));
+          
+          debugPrint('狀態回應: ${response.statusCode}');
+          
+          if (response.statusCode == 200) {
+            final data = json.decode(response.body);
+            debugPrint('狀態數據: $data');
+            if (data['status'] == 'ok') {
+              // Update recording status
+              if (data['recording'] == true && _status != RecordingStatus.recording) {
+                _status = RecordingStatus.recording;
+                _isRecordingActive = true;
+                _startTime = DateTime.now();
+                _seconds = 0;
+                _recordingDuration = 0.0;
+                if (data['file'] != null) {
+                  _currentVideoPath = data['file'];
+                }
+                _startTimer();
+                notifyListeners();
+              } else if (data['recording'] == false && _isRecordingActive) {
+                // Recording has stopped
+                _status = RecordingStatus.idle;
+                _isRecordingActive = false;
+                _stopTimer();
+                
+                if (data['file'] != null) {
+                  _currentVideoPath = data['file'];
+                  final filename = (data['file'] as String).split('/').last;
+                  if (!_recordedVideos.contains(filename)) {
+                    _recordedVideos.add(filename);
+                  }
+                }
+                
+                _startTime = null;
+                _seconds = 0;
+                _recordingDuration = 0.0;
+                notifyListeners();
+              }
+              
+              // Update duration if available
+              if (data['started_at'] != null) {
+                final startTime = DateTime.fromMillisecondsSinceEpoch((data['started_at'] * 1000).toInt());
+                _recordingDuration = DateTime.now().difference(startTime).inSeconds.toDouble();
+                notifyListeners();
+              }
+            }
+            // 成功响应，退出重试循环
+            return;
+          } else if (response.statusCode == 404) {
+            // 如果是404错误，可能服务器不支持此端点
+            debugPrint('服務器不支持狀態端點');
+            return;
+          }
+        } on TimeoutException catch (e) {
+          retryCount++;
+          debugPrint('狀態更新請求超時 (第$retryCount次重試): $e');
+          if (retryCount > maxRetries) {
+            throw e; // 超过最大重试次数，抛出异常
+          }
+          // 等待一段时间再重试
+          await Future.delayed(const Duration(seconds: 2));
         }
       }
-
-      _startTime = null;
-      _seconds = 0;
-      _recordingDuration = 0.0;
-      notifyListeners();
-    });
-
-    _socket!.on('video_converting', (data) {
-      debugPrint(' 文件轉換中: $data');
-      _status = RecordingStatus.converting;
-      notifyListeners();
-    });
-
-    _socket!.on('video_convert_success', (data) {
-      debugPrint('文件轉換成功: $data');
-      _status = RecordingStatus.idle;
-      if (data['file'] != null) {
-        _currentVideoPath = data['file'];
-      }
-      notifyListeners();
-    });
-
-    _socket!.on('video_convert_error', (data) {
-      debugPrint('文件轉換失敗: $data');
-      _handleError('文件轉換失敗: ${data['error']}');
-    });
-
-    _socket!.on('video_error', (data) {
-      debugPrint(' 錄影錯誤: $data');
-      _handleError('錄影錯誤: ${data['error']}');
-    });
+    } catch (e) {
+      debugPrint('狀態更新失敗: $e');
+    }
   }
 
   void _startTimer() {
@@ -248,6 +244,7 @@ class VideoRecordingService extends ChangeNotifier {
 
     _connectionStatus = ConnectionStatus.reconnecting;
     _cancelReconnectTimer();
+    _stopStatusTimer();
 
     _reconnectTimer = Timer(const Duration(seconds: 3), () {
       if (_connectionStatus == ConnectionStatus.reconnecting) {
@@ -265,21 +262,26 @@ class VideoRecordingService extends ChangeNotifier {
   void _disconnect() {
     _cancelReconnectTimer();
     _stopTimer();
-
-    if (_socket != null) {
-      _socket!.dispose();
-      _socket = null;
-    }
-
+    _stopStatusTimer();
     _connectionStatus = ConnectionStatus.disconnected;
-    debugPrint(' WebSocket 已斷開');
+    debugPrint(' HTTP 連接已斷開');
   }
 
   // 公共方法
   Future<bool> startRecording({String? filename, int? duration}) async {
+    // 檢查連線狀態，如果未連線則嘗試重新連線
     if (!isConnected) {
-      _handleError('未連接到服務器');
-      return false;
+      debugPrint('未連接到服務器，嘗試重新連線...');
+      await reconnect();
+      
+      // 等待短暫時間讓連線建立
+      await Future.delayed(const Duration(milliseconds: 500));
+      
+      // 再次檢查連線狀態
+      if (!isConnected) {
+        _handleError('無法連接到媒體服務器');
+        return false;
+      }
     }
 
     if (_status == RecordingStatus.recording) {
@@ -295,15 +297,52 @@ class VideoRecordingService extends ChangeNotifier {
     _clearError();
 
     try {
-      final data = <String, dynamic>{};
-      if (filename != null) data['filename'] = filename;
-      if (duration != null) data['duration'] = duration;
-
-      _socket!.emit('video_start', data);
-      debugPrint(' 發送錄影開始請求: $data');
-      return true;
+      final uri = Uri.parse('http://$_serverIP:8770/video/start');
+      final queryParams = <String, String>{};
+      
+      if (filename != null) queryParams['filename'] = filename;
+      if (duration != null) queryParams['duration'] = duration.toString();
+      
+      debugPrint('發送錄影開始請求到: $uri');
+      
+      // Increase timeout for recording start request since it might take time
+      final response = await http.post(uri.replace(queryParameters: queryParams))
+          .timeout(const Duration(seconds: 30)); // Increased from 10 to 30 seconds
+      
+      debugPrint('錄影開始回應: ${response.statusCode}');
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        debugPrint('錄影開始回應數據: $data');
+        if (data['status'] == 'ok') {
+          _status = RecordingStatus.recording;
+          _isRecordingActive = true;
+          _startTime = DateTime.now();
+          _seconds = 0;
+          _recordingDuration = 0.0;
+          // 伺服器現在會立即返回錄影檔案路徑
+          if (data['file'] != null) {
+            _currentVideoPath = data['file'];
+          }
+          _startTimer();
+          notifyListeners();
+          debugPrint('錄影開始成功: ${data['file']}');
+          return true;
+        } else {
+          _handleError('錄影啟動失敗: ${data['message']}');
+          return false;
+        }
+      } else {
+        _handleError('錄影啟動請求失敗: ${response.statusCode} - ${response.reasonPhrase}');
+        return false;
+      }
+    } on TimeoutException catch (e) {
+      _handleError('錄影啟動請求超時，請檢查服務器是否正常運行');
+      debugPrint('錄影啟動請求超時: $e');
+      return false;
     } catch (e) {
       _handleError('發送錄影開始請求失敗: $e');
+      debugPrint('錄影啟動請求錯誤: $e');
       return false;
     }
   }
@@ -320,11 +359,58 @@ class VideoRecordingService extends ChangeNotifier {
     }
 
     try {
-      _socket!.emit('video_stop');
-      debugPrint(' 發送停止錄影請求');
-      return true;
+      final uri = Uri.parse('http://$_serverIP:8770/video/stop');
+      debugPrint('發送停止錄影請求到: $uri');
+      
+      // Increase timeout for recording stop request
+      final response = await http.post(uri).timeout(const Duration(seconds: 30)); // Increased from 15 to 30 seconds
+      
+      debugPrint('停止錄影回應: ${response.statusCode}');
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        debugPrint('停止錄影回應數據: $data');
+        if (data['status'] == 'ok') {
+          _status = RecordingStatus.stopping;
+          notifyListeners();
+          
+          // Wait a bit and then update to idle
+          Future.delayed(const Duration(seconds: 2), () {
+            _status = RecordingStatus.idle;
+            _isRecordingActive = false;
+            _stopTimer();
+            
+            if (data['file'] != null) {
+              _currentVideoPath = data['file'];
+              final filename = (data['file'] as String).split('/').last;
+              if (!_recordedVideos.contains(filename)) {
+                _recordedVideos.add(filename);
+              }
+            }
+            
+            _startTime = null;
+            _seconds = 0;
+            _recordingDuration = 0.0;
+            notifyListeners();
+          });
+          
+          debugPrint(' 停止錄影請求成功');
+          return true;
+        } else {
+          _handleError('停止錄影失敗: ${data['message']}');
+          return false;
+        }
+      } else {
+        _handleError('停止錄影請求失敗: ${response.statusCode} - ${response.reasonPhrase}');
+        return false;
+      }
+    } on TimeoutException catch (e) {
+      _handleError('停止錄影請求超時，請檢查服務器是否正常運行');
+      debugPrint('停止錄影請求超時: $e');
+      return false;
     } catch (e) {
       _handleError('發送停止錄影請求失敗: $e');
+      debugPrint('停止錄影請求錯誤: $e');
       return false;
     }
   }
@@ -335,51 +421,51 @@ class VideoRecordingService extends ChangeNotifier {
       throw Exception('未連接到服務器');
     }
 
-    final completer = Completer<String>();
-
-    void onPhotoSuccess(dynamic data) {
-      if (data != null && data['file'] != null) {
-        completer.complete(data['file']);
-      } else {
-        completer.completeError(Exception('拍照成功但未返回檔案路徑'));
-      }
-    }
-
-    void onPhotoError(dynamic data) {
-      final error = data != null ? data['error'] : '未知錯誤';
-      completer.completeError(Exception('拍照錯誤: $error'));
-    }
-
-    _socket!.on('photo_success', onPhotoSuccess);
-    _socket!.on('photo_error', onPhotoError);
-
     try {
-      final data = <String, dynamic>{};
-      if (filename != null) data['filename'] = filename;
-      _socket!.emit('photo_capture', data);
-      debugPrint('發送拍照請求: $data');
-
-      final filePath = await completer.future.timeout(const Duration(seconds: 15));
-      return filePath;
+      final uri = Uri.parse('http://$_serverIP:8770/photo');
+      final queryParams = <String, String>{};
+      
+      if (filename != null) queryParams['filename'] = filename;
+      
+      debugPrint('發送拍照請求到: $uri');
+      
+      final response = await http.post(uri.replace(queryParameters: queryParams))
+          .timeout(const Duration(seconds: 30)); // Increased from 15 to 30 seconds
+      
+      debugPrint('拍照回應: ${response.statusCode}');
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        debugPrint('拍照回應數據: $data');
+        if (data['status'] == 'ok' && data['file'] != null) {
+          debugPrint('拍照成功: ${data['file']}');
+          return data['file'];
+        } else {
+          final errorMessage = data['message'] ?? '未知錯誤';
+          throw Exception('拍照失敗: $errorMessage');
+        }
+      } else {
+        throw Exception('拍照請求失敗: ${response.statusCode} - ${response.reasonPhrase}');
+      }
+    } on TimeoutException catch (e) {
+      _handleError('拍照請求超時，請檢查服務器是否正常運行');
+      debugPrint('拍照請求超時: $e');
+      throw Exception('拍照請求超時，請檢查服務器是否正常運行');
     } catch (e) {
       _handleError('拍照失敗: $e');
+      debugPrint('拍照請求錯誤: $e');
       throw e;
-    } finally {
-      _socket!.off('photo_success', onPhotoSuccess);
-      _socket!.off('photo_error', onPhotoError);
     }
   }
 
   void requestVideoStatus() {
     if (isConnected) {
-      _socket!.emit('video_status');
+      _updateStatus();
     }
   }
 
   void requestStorageStatus() {
-    if (isConnected) {
-      _socket!.emit('storage_status');
-    }
+    // Not implemented for HTTP version
   }
 
   Future<bool> downloadRecording(String filename, String localPath) async {
@@ -410,6 +496,7 @@ class VideoRecordingService extends ChangeNotifier {
     _lastError = error;
     if (_status == RecordingStatus.recording) {
       _status = RecordingStatus.error;
+      _isRecordingActive = false;
       _stopTimer();
     }
     notifyListeners();

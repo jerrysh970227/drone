@@ -3,10 +3,11 @@ import websockets
 import json
 import logging
 from pymavlink import mavutil
-import RPi.GPIO as GPIO
+import pigpio
 import signal
 import sys
-from contextlib import asynccontextmanager
+import time
+import math
 
 # 配置日誌
 logging.basicConfig(
@@ -19,27 +20,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 硬件配置
+# 硬體配置
 LED_PIN = 27
-SERVO_PIN = 18
+SERVO_PIN = 22
 
 class HardwareManager:
-    """統一管理所有硬件組件"""
+    """統一管理所有硬體組件"""
     def __init__(self):
         self.master = None
         self.servo = None
-        self.gpio_initialized = False
+        self.pi = None
         self.connected_clients = set()
+        self.last_heartbeat_time = time.time()
     
     def initialize(self):
-        """初始化所有硬件"""
+        """初始化所有硬體"""
         try:
-            # 初始化 GPIO
-            if not self.gpio_initialized:
-                GPIO.setmode(GPIO.BCM)
-                GPIO.setwarnings(False)
-                self.gpio_initialized = True
-                logger.info("GPIO 初始化完成")
+            # 初始化 pigpio
+            self.pi = pigpio.pi()
+            if not self.pi.connected:
+                logger.error("pigpio daemon 未運行,請先執行 'sudo pigpiod'")
+                return False
+            logger.info("pigpio 連接成功")
             
             # 初始化 MAVLink
             self._init_mavlink()
@@ -52,7 +54,7 @@ class HardwareManager:
             
             return True
         except Exception as e:
-            logger.error(f"硬件初始化失敗: {e}")
+            logger.error(f"硬體初始化失敗: {e}")
             return False
     
     def _init_mavlink(self):
@@ -68,24 +70,20 @@ class HardwareManager:
     def _setup_led(self):
         """設置 LED"""
         try:
-            # 確保LED_PIN已正確設置
-            if not isinstance(LED_PIN, int) or LED_PIN <= 0:
-                logger.error(f"LED_PIN設置不正確: {LED_PIN}")
-                return
-                
-            GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
-            # 測試LED是否正常工作
-            GPIO.output(LED_PIN, GPIO.HIGH)
+            self.pi.set_mode(LED_PIN, pigpio.OUTPUT)
+            self.pi.write(LED_PIN, 0)
+            # 測試 LED
+            self.pi.write(LED_PIN, 1)
             time.sleep(0.1)
-            GPIO.output(LED_PIN, GPIO.LOW)
-            logger.info(f"LED 已初始化並測試於 GPIO{LED_PIN}")
+            self.pi.write(LED_PIN, 0)
+            logger.info(f"LED 已初始化於 GPIO{LED_PIN}")
         except Exception as e:
             logger.error(f"LED 初始化失敗: {e}")
     
     def _setup_servo(self):
         """設置伺服馬達"""
         try:
-            self.servo = CameraServo(pin=SERVO_PIN)
+            self.servo = CameraServo(self.pi, pin=SERVO_PIN)
             logger.info("伺服馬達初始化完成")
         except Exception as e:
             logger.error(f"伺服馬達初始化失敗: {e}")
@@ -93,86 +91,139 @@ class HardwareManager:
     
     def cleanup(self):
         """清理所有資源"""
-        logger.info("開始清理硬件資源...")
+        logger.info("開始清理硬體資源...")
         
         if self.servo:
             self.servo.cleanup()
         
-        if self.gpio_initialized:
-            GPIO.cleanup()
-            self.gpio_initialized = False
+        if self.pi and self.pi.connected:
+            self.pi.stop()
         
-        logger.info("硬件資源清理完成")
+        logger.info("硬體資源清理完成")
 
-# 全局硬件管理器
+# 全局硬體管理器
 hardware = HardwareManager()
 
 class CameraServo:
-    """改進的伺服馬達控制類"""
-    def __init__(self, pin=18, frequency=333, initial_percentage=0.065):  # Increased frequency to 333Hz
+    """使用 pigpio 的伺服馬達控制類"""
+    def __init__(self, pi, pin=22, min_pw=500, max_pw=2500, angle_min=-45.0, angle_max=90.0):
+        self.pi = pi
         self.pin = pin
-        self.frequency = frequency
-        self.duty_cycle = initial_percentage
-        self.pwm = None
-        self.last_angle = None  # Track last sent angle to prevent jitter
-        self.angle_threshold = 0.5  # Minimum angle change to trigger update
+        self.min_pw = min_pw
+        self.max_pw = max_pw
+        self.angle_min = angle_min
+        self.angle_max = angle_max
+        self.current_angle = 0.0
+        self.is_moving = False
         self._setup()
     
     def _setup(self):
         """設置伺服馬達"""
         try:
-            GPIO.setup(self.pin, GPIO.OUT)
-            self.pwm = GPIO.PWM(self.pin, self.frequency)
-            self.pwm.start(self.duty_cycle * 100)
-            logger.info(f"伺服馬達設置完成 - Pin: {self.pin}, 頻率: {self.frequency}Hz")
+            # 設置為初始位置 (0度)
+            initial_pw = self._angle_to_pw(0.0)
+            self.pi.set_servo_pulsewidth(self.pin, int(initial_pw))
+            time.sleep(0.5)  # 等待穩定
+            logger.info(f"伺服馬達設置完成 - Pin: {self.pin}, 範圍: [{self.angle_min}°, {self.angle_max}°]")
         except Exception as e:
             logger.error(f"伺服馬達設置失敗: {e}")
-            self.pwm = None
     
-    def set_angle(self, target_angle):
-        """設置伺服馬達角度"""
-        if self.pwm is None:
-            logger.error("伺服馬達未初始化")
+    def _angle_to_pw(self, angle):
+        """將角度轉換為脈衝寬度 (μs)"""
+        angle = max(min(angle, self.angle_max), self.angle_min)
+        # 將角度從 [angle_min, angle_max] 映射到 [min_pw, max_pw]
+        normalized = (angle - self.angle_min) / (self.angle_max - self.angle_min)
+        return self.min_pw + normalized * (self.max_pw - self.min_pw)
+    
+    def _pw_to_angle(self, pw):
+        """將脈衝寬度轉換為角度"""
+        if pw <= 0:
+            return self.current_angle
+        normalized = (pw - self.min_pw) / (self.max_pw - self.min_pw)
+        return self.angle_min + normalized * (self.angle_max - self.angle_min)
+    
+    def _ease(self, t, mode='sine'):
+        """緩動函數"""
+        if mode == 'linear':
+            return t
+        elif mode == 'quad':
+            return 2*t*t if t < 0.5 else 1 - 2*(1-t)*(1-t)
+        elif mode == 'cubic':
+            return 4*t*t*t if t < 0.5 else 1 - pow(-2*t+2, 3)/2
+        elif mode == 'sine':
+            return 0.5 * (1 - math.cos(math.pi * t))
+        return t
+    
+    def get_current_angle(self):
+        """獲取當前角度"""
+        try:
+            pw = self.pi.get_servo_pulsewidth(self.pin)
+            if pw > 0:
+                return self._pw_to_angle(pw)
+        except:
+            pass
+        return self.current_angle
+    
+    async def move_to(self, target_angle, duration=0.8, steps=100, easing_mode='sine'):
+        """平滑移動到目標角度 (異步版本)"""
+        if self.is_moving:
+            logger.warning("伺服馬達正在移動中,跳過此次命令")
             return False
         
+        self.is_moving = True
+        
         try:
-            # 限制角度範圍：-45° 到 90°
-            target_angle = max(-45, min(90, target_angle))
+            start_angle = self.get_current_angle()
+            target_angle = max(min(target_angle, self.angle_max), self.angle_min)
             
-            # Check if angle change is significant enough to avoid jitter
-            if self.last_angle is not None and abs(target_angle - self.last_angle) < self.angle_threshold:
-                logger.debug(f"角度變化過小，跳過更新: {target_angle:.1f}° (上次: {self.last_angle:.1f}°)")
-                return True  # Still return success but don't update
+            steps = max(1, int(steps))
+            step_delay = max(0.001, duration / steps)
             
-            # Calculate duty cycle with improved precision
-            self.duty_cycle = (target_angle + 45) * 0.08 / 135 + 0.025
-            self.duty_cycle = max(0.025, min(0.105, self.duty_cycle))
+            logger.info(f"伺服馬達移動: {start_angle:.1f}° → {target_angle:.1f}° (耗時 {duration}s, {easing_mode})")
             
-            # Update PWM signal
-            self.pwm.ChangeDutyCycle(self.duty_cycle * 100)
-            self.last_angle = target_angle
+            for i in range(steps + 1):
+                t = i / steps
+                te = self._ease(t, easing_mode)
+                angle = start_angle + (target_angle - start_angle) * te
+                pw = self._angle_to_pw(angle)
+                self.pi.set_servo_pulsewidth(self.pin, int(pw))
+                await asyncio.sleep(step_delay)
             
-            # Add small delay for smoother transition (reduces jitter)
-            import time
-            time.sleep(0.01)
+            self.current_angle = target_angle
+            logger.info(f"伺服馬達到達目標位置: {target_angle:.1f}°")
+            return True
             
-            logger.info(f"設置伺服角度: {target_angle:.1f}°")
+        except Exception as e:
+            logger.error(f"伺服馬達移動失敗: {e}")
+            return False
+        finally:
+            self.is_moving = False
+    
+    def set_angle(self, target_angle):
+        """立即設置角度 (同步版本,用於兼容)"""
+        try:
+            target_angle = max(min(target_angle, self.angle_max), self.angle_min)
+            pw = self._angle_to_pw(target_angle)
+            self.pi.set_servo_pulsewidth(self.pin, int(pw))
+            self.current_angle = target_angle
+            logger.info(f"伺服角度已設置: {target_angle:.1f}°")
             return True
         except Exception as e:
             logger.error(f"設置伺服角度失敗: {e}")
             return False
     
     def get_angle(self):
-        """獲取當前角度"""
-        if self.pwm is None:
-            return 0.0
-        return 135 * (self.duty_cycle - 0.025) / 0.08 - 45
+        """獲取角度 (兼容方法)"""
+        return self.get_current_angle()
     
     def cleanup(self):
         """清理伺服馬達資源"""
-        if self.pwm:
-            self.pwm.stop()
+        try:
+            # 關閉 PWM 輸出
+            self.pi.set_servo_pulsewidth(self.pin, 0)
             logger.info("伺服馬達已停止")
+        except Exception as e:
+            logger.error(f"伺服馬達清理失敗: {e}")
 
 class MAVLinkController:
     """MAVLink 控制器"""
@@ -252,10 +303,10 @@ class LEDController:
     def set_led(state: bool):
         """設置 LED 狀態"""
         try:
-            if not hardware.gpio_initialized:
-                logger.warning("GPIO 未初始化")
+            if not hardware.pi or not hardware.pi.connected:
+                logger.warning("pigpio 未連接")
                 return False
-            GPIO.output(LED_PIN, GPIO.HIGH if state else GPIO.LOW)
+            hardware.pi.write(LED_PIN, 1 if state else 0)
             logger.info(f"LED 狀態: {'ON' if state else 'OFF'}")
             return True
         except Exception as e:
@@ -266,14 +317,14 @@ class LEDController:
     def toggle_led():
         """切換 LED 狀態"""
         try:
-            if not hardware.gpio_initialized:
-                logger.warning("GPIO 未初始化")
+            if not hardware.pi or not hardware.pi.connected:
+                logger.warning("pigpio 未連接")
                 return False
-            current = GPIO.input(LED_PIN)
-            new_state = GPIO.LOW if current == GPIO.HIGH else GPIO.HIGH
-            GPIO.output(LED_PIN, new_state)
-            logger.info(f"LED 已切換為: {'ON' if new_state == GPIO.HIGH else 'OFF'}")
-            return new_state == GPIO.HIGH
+            current = hardware.pi.read(LED_PIN)
+            new_state = 0 if current else 1
+            hardware.pi.write(LED_PIN, new_state)
+            logger.info(f"LED 已切換為: {'ON' if new_state else 'OFF'}")
+            return new_state == 1
         except Exception as e:
             logger.error(f"切換 LED 失敗: {e}")
             return False
@@ -282,11 +333,9 @@ class LEDController:
     def get_led_state():
         """獲取 LED 狀態"""
         try:
-            if not hardware.gpio_initialized:
-                logger.info("GPIO 未初始化，返回默認 LED 狀態: False")
+            if not hardware.pi or not hardware.pi.connected:
                 return False
-            state = GPIO.input(LED_PIN) == GPIO.HIGH
-            logger.info(f"讀取 LED 狀態: {'ON' if state else 'OFF'}")
+            state = hardware.pi.read(LED_PIN) == 1
             return state
         except Exception as e:
             logger.error(f"讀取 LED 狀態失敗: {e}")
@@ -295,28 +344,35 @@ class LEDController:
 async def initialize_servo():
     """初始化伺服馬達序列"""
     if not hardware.servo:
-        logger.warning("伺服馬達未初始化，跳過初始化序列")
+        logger.warning("伺服馬達未初始化,跳過初始化序列")
         return False
     
     logger.info("開始執行伺服馬達初始化序列")
     try:
-        positions = [0, -45, 0, 90, 0]
-        # 使用LEDController來控制LED
+        # 優雅的初始化動作序列
+        positions = [
+            (0, 0.6, 'sine'),      # 回到中心
+            (45, 0.8, 'sine'),     # 向上
+            (-45, 1.2, 'sine'),    # 向下
+            (0, 0.8, 'cubic'),     # 回到中心
+        ]
+        
         LEDController.set_led(True)
-        for position in positions:
-            if hardware.servo.set_angle(position):
-                await asyncio.sleep(0.5)
-            else:
-                logger.warning(f"無法設置伺服角度到 {position}")
+        
+        for angle, duration, easing in positions:
+            success = await hardware.servo.move_to(angle, duration=duration, steps=100, easing_mode=easing)
+            if not success:
+                logger.warning(f"無法移動伺服馬達到 {angle}°")
+                LEDController.set_led(False)
+                return False
+            await asyncio.sleep(0.2)  # 短暫停頓
+        
         LEDController.set_led(False)
         logger.info("伺服馬達初始化序列完成")
         return True
+        
     except Exception as e:
-        # 確保在出錯時關閉LED
-        try:
-            LEDController.set_led(False)
-        except:
-            pass
+        LEDController.set_led(False)
         logger.error(f"伺服馬達初始化序列失敗: {e}")
         return False
 
@@ -329,6 +385,12 @@ async def handle_connection(websocket, path=None):
     mavlink_controller = MAVLinkController(hardware.master)
     
     try:
+        await websocket.send(json.dumps({
+            "status": "ok",
+            "message": "Connected to drone server",
+            "timestamp": time.time()
+        }))
+        
         async for message in websocket:
             logger.debug(f"收到來自 {client_id} 的消息: {message}")
             
@@ -336,31 +398,20 @@ async def handle_connection(websocket, path=None):
                 data = json.loads(message)
                 response = await process_message(data, mavlink_controller)
                 await websocket.send(json.dumps(response))
+                hardware.last_heartbeat_time = time.time()
                 
             except json.JSONDecodeError as e:
                 logger.error(f"無效 JSON 來自 {client_id}: {e}")
-                error_response = {"status": "error", "message": f"無效 JSON: {str(e)}"}
-                await websocket.send(json.dumps(error_response))
+                await websocket.send(json.dumps({"status": "error", "message": f"無效 JSON: {str(e)}"}))
                 
             except Exception as e:
                 logger.error(f"處理消息時出錯 {client_id}: {e}")
-                error_response = {"status": "error", "message": f"處理錯誤: {str(e)}"}
-                await websocket.send(json.dumps(error_response))
+                await websocket.send(json.dumps({"status": "error", "message": f"處理錯誤: {str(e)}"}))
     
     except websockets.exceptions.ConnectionClosed as e:
         logger.info(f"客戶端 {client_id} 正常斷開: {e.code}")
-    except websockets.exceptions.ConnectionClosedError as e:
-        logger.info(f"客戶端 {client_id} 連接錯誤: {e}")
-    except websockets.exceptions.ConnectionClosedOK as e:
-        logger.info(f"客戶端 {client_id} 正常關閉: {e}")
     except Exception as e:
         logger.error(f"客戶端 {client_id} 異常斷開: {e}")
-        # Send error response before closing
-        try:
-            error_response = {"status": "error", "message": f"連接異常: {str(e)}"}
-            await websocket.send(json.dumps(error_response))
-        except:
-            pass
     finally:
         hardware.connected_clients.discard(websocket)
         logger.info(f"客戶端 {client_id} 連接已清理")
@@ -376,12 +427,11 @@ async def process_message(data, mavlink_controller):
     elif message_type == "servo_control":
         return await handle_servo_message(data)
     elif message_type == "status_request":
-        # Handle status request messages
         return {
             "status": "ok",
             "message": "Status request received",
             "angle": hardware.servo.get_angle() if hardware.servo else 0,
-            "led": LEDController.get_led_state() if hardware.gpio_initialized else False
+            "led": LEDController.get_led_state()
         }
     else:
         return {"status": "error", "message": f"未知消息類型: {message_type}"}
@@ -424,24 +474,20 @@ async def handle_command_message(data, mavlink_controller):
     
     elif action == "LED_ON":
         success = LEDController.set_led(True)
-        # Always return the current LED state, even if the command failed
         current_led_state = LEDController.get_led_state()
         return {"status": "ok" if success else "error", "led": current_led_state, "message": "LED ON" if success else "Failed to turn LED ON"}
     
     elif action == "LED_OFF":
         success = LEDController.set_led(False)
-        # Always return the current LED state, even if the command failed
         current_led_state = LEDController.get_led_state()
         return {"status": "ok" if success else "error", "led": current_led_state, "message": "LED OFF" if success else "Failed to turn LED OFF"}
     
     elif action == "LED_TOGGLE":
         new_state = LEDController.toggle_led()
-        # Always return the current LED state after toggle
         current_led_state = LEDController.get_led_state()
         return {"status": "ok", "led": current_led_state, "message": f"LED {'ON' if current_led_state else 'OFF'}"}
     
     elif action == "REQUEST_SERVO_ANGLE":
-        # Handle servo angle request
         angle = hardware.servo.get_angle() if hardware.servo else 0
         return {
             "status": "ok",
@@ -459,15 +505,20 @@ async def handle_servo_message(data):
     
     try:
         angle = float(data.get('angle', 0))
+        duration = float(data.get('duration', 0.8))
+        steps = int(data.get('steps', 100))
+        easing = data.get('easing', 'sine')
         
-        if not (-45 <= angle <= 90):
+        if not (hardware.servo.angle_min <= angle <= hardware.servo.angle_max):
             return {
                 "status": "error",
-                "message": f"角度 {angle} 超出範圍 [-45, 90]",
+                "message": f"角度 {angle} 超出範圍 [{hardware.servo.angle_min}, {hardware.servo.angle_max}]",
                 "angle": hardware.servo.get_angle()
             }
         
-        success = hardware.servo.set_angle(angle)
+        # 使用異步平滑移動
+        success = await hardware.servo.move_to(angle, duration=duration, steps=steps, easing_mode=easing)
+        
         return {
             "status": "ok" if success else "error",
             "angle": hardware.servo.get_angle(),
@@ -479,19 +530,18 @@ async def handle_servo_message(data):
 
 def signal_handler(signum, frame):
     """信號處理器"""
-    logger.info(f"收到信號 {signum}，正在關閉服務器...")
+    logger.info(f"收到信號 {signum},正在關閉服務器...")
     hardware.cleanup()
     sys.exit(0)
 
 async def main():
     """主函數"""
-    # 設置信號處理
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # 初始化硬件
+    # 初始化硬體
     if not hardware.initialize():
-        logger.error("硬件初始化失敗，退出程序")
+        logger.error("硬體初始化失敗,退出程序")
         return
     
     # 初始化伺服馬達
@@ -503,23 +553,17 @@ async def main():
             handle_connection,
             "0.0.0.0", 8766,
             ping_interval=30,
-            ping_timeout=20
+            ping_timeout=20,
+            close_timeout=10
         )
         logger.info("WebSocket 伺服器啟動於 ws://0.0.0.0:8766")
-        logger.info(f"當前連接的客戶端數量: {len(hardware.connected_clients)}")
         
-        # 定期報告客戶端連接狀態
         async def report_clients():
             while True:
-                await asyncio.sleep(60)  # 每分鐘報告一次
+                await asyncio.sleep(60)
                 logger.info(f"當前連接的客戶端數量: {len(hardware.connected_clients)}")
-                if hardware.connected_clients:
-                    logger.info(f"連接的客戶端: {[str(client.remote_address) for client in hardware.connected_clients]}")
         
-        # 啟動客戶端報告任務
         asyncio.create_task(report_clients())
-        
-        # 等待服務器運行
         await server.wait_closed()
         
     except Exception as e:

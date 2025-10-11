@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:io';
 import 'package:drone/model/RecordService.dart';
 import 'package:drone/ui/RecordButton.dart';
 import 'package:http/http.dart' as http;
@@ -10,6 +11,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_joystick/flutter_joystick.dart';
 import 'package:latlong2/latlong.dart' as latLng;
 import 'package:logging/logging.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../map/mapInfo.dart';
 import '../constants.dart';
@@ -460,6 +463,11 @@ void _onRecordingStateChanged(){
   }
 
   void startRecording() async {
+    // 確保連線狀態正確
+    if (!_record.isConnected) {
+      await _record.reconnect();
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
     await _record.startRecording();
   }
 
@@ -822,6 +830,7 @@ void _onRecordingStateChanged(){
               ),
             ),
             const SizedBox(width: 10),
+            // WebSocket連線
             _buildConnectionButton(
               icon:
                   isWebSocketConnected
@@ -829,13 +838,19 @@ void _onRecordingStateChanged(){
                       : Icons.wifi_off_rounded,
               isConnected: isWebSocketConnected,
               onPressed: () {
-                if (!isWebSocketConnected) _controller.connect();
-                setState(() {
-                  isWebSocketConnected = isWebSocketConnected;
-                });
+                if (isWebSocketConnected) {
+                  _controller.disconnect();
+                  setState(() {
+                    isWebSocketConnected = false;
+                  });
+                } else {
+                  _controller.connect();
+                  // 狀態會在 controller 的回調中自動更新
+                }
               },
               tooltip: 'WebSocket連線',
             ),
+            // 視訊串流
             const SizedBox(width: 8),
             _buildConnectionButton(
               icon:
@@ -844,10 +859,14 @@ void _onRecordingStateChanged(){
                       : Icons.videocam_off_rounded,
               isConnected: isCameraConnected,
               onPressed: () {
-                if (isStreamLoaded)
+                if (isCameraConnected) {
                   disconnect();
-                else
+                  setState(() {
+                    isCameraConnected = false;
+                  });
+                } else {
                   reconnect();
+                }
               },
               tooltip: '視訊串流',
             ),
@@ -1351,17 +1370,75 @@ void _onRecordingStateChanged(){
     );
   }
 
-  Future<void> takePhoto(BuildContext context, VideoRecordingService service) async {
+  Future<bool> _saveLocalPhoto(Uint8List imageBytes) async {
     try {
-      final filePath = await service.capturePhoto();
-      log.info('拍照成功: $filePath');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('拍照成功')),
-      );
+      // 请求存储权限
+      final status = await Permission.storage.request();
+      if (!status.isGranted) {
+        log.severe('存储权限被拒绝');
+        return false;
+      }
+      
+      // 获取应用文档目录
+      final directory = await getApplicationDocumentsDirectory();
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final filePath = '${directory.path}/local_photo_$timestamp.jpg';
+      
+      // 保存图片文件
+      final file = File(filePath);
+      await file.writeAsBytes(imageBytes);
+      
+      log.info('本地照片已保存: $filePath');
+      return true;
+    } catch (e) {
+      log.severe('保存本地照片失败: $e');
+      return false;
+    }
+  }
+
+  void takePhoto(BuildContext context, VideoRecordingService record) async {
+    try {
+      // 向树莓派发送拍照指令
+      final uri = Uri.parse('http://${AppConfig.droneIP}:8770/photo');
+      final res = await http.post(uri).timeout(const Duration(seconds: 8));
+      
+      // 同时捕获本地视频流的一帧作为本地照片
+      bool localPhotoSaved = false;
+      if (_currentFrame != null) {
+        localPhotoSaved = await _saveLocalPhoto(_currentFrame!);
+      }
+      
+      if (res.statusCode == 200) {
+        log.info('拍照成功');
+        String message = '已拍照';
+        if (localPhotoSaved) {
+          message += ' (本地照片已保存)';
+        } else if (_currentFrame != null) {
+          message += ' (本地照片保存失败)';
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message)),
+        );
+      } else {
+        log.severe('拍照失敗: ${res.body}');
+        String message = '拍照失敗: ${res.statusCode}';
+        if (localPhotoSaved) {
+          message += ' (本地照片已保存)';
+        } else if (_currentFrame != null) {
+          message += ' (本地照片保存失败)';
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message)),
+        );
+      }
     } catch (e) {
       log.severe('拍照錯誤: $e');
+      String message = '拍照錯誤: $e';
+      if (_currentFrame != null) {
+        message += ' (本地照片可能保存失败)';
+      }
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('拍照錯誤: $e')),
+        SnackBar(content: Text(message)),
       );
     }
   }

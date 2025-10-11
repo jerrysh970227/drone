@@ -1,0 +1,6 @@
+websockets>=10.0
+requests>=2.25.0
+flask>=2.0.0
+flask-socketio>=5.0.0
+python-socketio>=5.0.0
+flask-cors>=3.0.0

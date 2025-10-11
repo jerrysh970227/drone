@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'package:logging/logging.dart';
 import 'package:web_socket_channel/io.dart';
+import 'package:web_socket_channel/status.dart' as status;
 import '../../constants.dart';
 
 enum ConnectionState {
@@ -77,7 +78,8 @@ class DroneController {
   Timer? _reconnectTimer;
   Timer? _controlTimer;
   Timer? _heartbeatTimer;
-  Timer? _servoCommandTimer; // Add timer to prevent servo command flooding
+  Timer? _servoCommandTimer;
+  Timer? _connectionTimeoutTimer;
   
   // Connection state
   ConnectionState _connectionState = ConnectionState.disconnected;
@@ -96,9 +98,14 @@ class DroneController {
   static const Duration controlInterval = Duration(milliseconds: 100);
   static const Duration heartbeatInterval = Duration(seconds: 30);
   static const Duration reconnectDelay = Duration(seconds: 3);
-  static const Duration connectTimeout = Duration(seconds: 15);
-  static const Duration servoCommandDelay = Duration(milliseconds: 50); // Delay between servo commands
+  static const Duration connectTimeout = Duration(seconds: 10);
+  static const Duration connectionCheckDelay = Duration(seconds: 2);
+  static const Duration servoCommandDelay = Duration(milliseconds: 100);
   static const double controlThreshold = 0.02;
+  
+  // Connection health tracking
+  DateTime _lastMessageTime = DateTime.now();
+  static const Duration connectionTimeoutThreshold = Duration(seconds: 45);
 
   DroneController({
     required this.onStatusChanged,
@@ -139,42 +146,67 @@ class DroneController {
   }
 
   Future<void> connect() async {
+    // 如果已經連線成功，則不重新連線
     if (isConnected) {
       _logMessage('Already connected, skipping connect attempt');
       return;
     }
-
+    
+    _logMessage('Initiating connection (Attempt ${_retries + 1}/${maxRetries + 1})');
+    _updateStatus(ConnectionState.connecting, 'Connecting to $connectionInfo...');
+    
     await disconnect();
     
     final trimmedIP = AppConfig.droneIP.trim();
     final uri = 'ws://$trimmedIP:${AppConfig.websocketPort}';
     
-    _logMessage('Connecting to $uri (Attempt ${_retries + 1}/${maxRetries + 1})');
-    _updateStatus(ConnectionState.connecting, 'Connecting to $connectionInfo...');
+    _logMessage('Connecting to $uri');
     
     try {
+      // Cancel any existing connection timeout timer
+      _connectionTimeoutTimer?.cancel();
+      
+      // Create connection with proper configuration
       _channel = IOWebSocketChannel.connect(
         Uri.parse(uri),
-        pingInterval: const Duration(seconds: 15),
+        pingInterval: const Duration(seconds: 30),  // Increased ping interval
         connectTimeout: connectTimeout,
       );
 
+      // Set up a connection timeout timer
+      _connectionTimeoutTimer = Timer(connectTimeout, () {
+        if (_connectionState == ConnectionState.connecting) {
+          _logMessage('Connection timeout after ${connectTimeout.inSeconds} seconds', isError: true);
+          _handleConnectionError('Connection timeout');
+        }
+      });
+      
       _setupWebSocketListeners();
       
-      // Wait a bit longer to see if connection establishes
-      await Future.delayed(const Duration(milliseconds: 1500));
+      // Wait for connection to establish
+      await Future.delayed(connectionCheckDelay);
       
       if (_connectionState == ConnectionState.connecting) {
-        _updateStatus(ConnectionState.connected, 'Connected to $connectionInfo');
-        _retries = 0;
-        _consecutiveFailures = 0;
-        _startHeartbeat();
-        
-        // Request initial status
-        _requestStatus();
+        // Check if we're actually connected
+        if (_channel != null) {
+          _updateStatus(ConnectionState.connected, 'Connected to $connectionInfo');
+          _retries = 0;
+          _consecutiveFailures = 0;
+          _startHeartbeat();
+          
+          // Cancel the connection timeout timer since we're connected
+          _connectionTimeoutTimer?.cancel();
+          
+          // Request initial status
+          _requestStatus();
+        } else {
+          _handleConnectionError('Connection failed - channel is null');
+        }
       }
       
     } catch (e, stackTrace) {
+      // Cancel the connection timeout timer on error
+      _connectionTimeoutTimer?.cancel();
       _logMessage('Connection failed: $e', isError: true);
       log.severe('Connection error details', e, stackTrace);
       _handleConnectionError('Failed to connect: $e');
@@ -192,11 +224,17 @@ class DroneController {
 
   void _handleWebSocketMessage(dynamic data) {
     try {
+      // Update last message time
+      _lastMessageTime = DateTime.now();
+      
       final response = jsonDecode(data.toString());
       _logMessage('Received: $response');
       
       // Reset consecutive failures on successful message
       _consecutiveFailures = 0;
+      
+      // Cancel connection timeout timer if still active
+      _connectionTimeoutTimer?.cancel();
       
       final status = response['status'];
       final message = response['message'];
@@ -212,9 +250,6 @@ class DroneController {
           // Always update LED state if it's present (even if null)
           if (angle != null || led != null) {
             _updateStatus(_connectionState, 'Status updated', angle: angle, led: led);
-          } else if (angle != null || led != null || (angle == null && led == null)) {
-            // If we have any status update, update the status
-            _updateStatus(_connectionState, 'Status updated', angle: angle, led: led);
           }
           break;
           
@@ -228,8 +263,6 @@ class DroneController {
             _logMessage('LED command format error (this is OK)', isError: false);
           } else {
             _logMessage('Server error: $message', isError: true);
-            // Don't immediately disconnect on server errors, just log them
-            // _updateStatus(ConnectionState.error, 'Server error: $message');
           }
           // Even on error, update LED state if provided
           if (led != null) {
@@ -252,11 +285,14 @@ class DroneController {
     final closeReason = _channel?.closeReason;
     _logMessage('WebSocket closed: $closeCode $closeReason');
     
+    // Cancel all timers
     _stopHeartbeat();
+    _connectionTimeoutTimer?.cancel();
+    
     _updateStatus(ConnectionState.disconnected, 'Connection closed');
     
-    // Don't auto-reconnect if it was a clean close (1000)
-    if (closeCode != 1000) {
+    // Don't auto-reconnect if it was a clean close
+    if (closeCode != status.goingAway && closeCode != status.normalClosure) {
       _scheduleReconnect('Connection closed unexpectedly with code $closeCode: $closeReason');
     }
   }
@@ -265,6 +301,9 @@ class DroneController {
     _consecutiveFailures++;
     _logMessage('WebSocket error: $error', isError: true);
     log.severe('WebSocket error details', error, stackTrace);
+    
+    // Cancel connection timeout timer on error
+    _connectionTimeoutTimer?.cancel();
     
     _stopHeartbeat();
     
@@ -281,6 +320,9 @@ class DroneController {
     _consecutiveFailures++;
     _logMessage('Connection error ($_consecutiveFailures consecutive): $error', isError: _consecutiveFailures >= 3);
     
+    // Cancel connection timeout timer
+    _connectionTimeoutTimer?.cancel();
+    
     // Only mark as error state after multiple consecutive failures
     if (_consecutiveFailures >= 3) {
       _updateStatus(ConnectionState.error, error);
@@ -294,6 +336,9 @@ class DroneController {
   }
 
   void _scheduleReconnect(String reason) {
+    // Cancel any existing reconnect timer
+    _reconnectTimer?.cancel();
+    
     if (_retries >= maxRetries) {
       _updateStatus(ConnectionState.error, 'Max retry attempts reached. Manual reconnection required.');
       return;
@@ -302,22 +347,28 @@ class DroneController {
     _retries++;
     _updateStatus(ConnectionState.reconnecting, 'Reconnecting in ${reconnectDelay.inSeconds}s... ($reason)');
     
-    // Gradually increase delay based on consecutive failures and retries
+    // Exponential backoff with maximum limit
     Duration delay;
     if (_consecutiveFailures >= maxConsecutiveFailures) {
-      delay = Duration(seconds: reconnectDelay.inSeconds * 3);
+      delay = Duration(seconds: reconnectDelay.inSeconds * 5);
     } else if (_consecutiveFailures >= maxConsecutiveFailures ~/ 2) {
-      delay = Duration(seconds: reconnectDelay.inSeconds * 2);
+      delay = Duration(seconds: reconnectDelay.inSeconds * 3);
     } else if (_retries > maxRetries ~/ 2) {
       delay = Duration(seconds: reconnectDelay.inSeconds * 2);
     } else {
       delay = reconnectDelay;
     }
     
+    // Cap the maximum delay to prevent excessively long waits
+    if (delay.inSeconds > 30) {
+      delay = const Duration(seconds: 30);
+    }
+    
     // Add some jitter to prevent thundering herd
     final jitter = Duration(milliseconds: (delay.inMilliseconds * (0.1 * (math.Random().nextDouble() - 0.5))).toInt());
     final finalDelay = delay + jitter;
     
+    _logMessage('Scheduled reconnect in ${finalDelay.inSeconds} seconds');
     _reconnectTimer = Timer(finalDelay, connect);
   }
 
@@ -328,6 +379,15 @@ class DroneController {
         timer.cancel();
         return;
       }
+      
+      // Check connection health
+      final timeSinceLastMessage = DateTime.now().difference(_lastMessageTime);
+      if (timeSinceLastMessage > connectionTimeoutThreshold) {
+        _logMessage('Connection appears stale (no messages for ${timeSinceLastMessage.inSeconds}s), triggering reconnect', isError: true);
+        _scheduleReconnect('Connection stale');
+        return;
+      }
+      
       _requestStatus();
     });
   }
@@ -486,12 +546,13 @@ class DroneController {
     _reconnectTimer?.cancel();
     _controlTimer?.cancel();
     _heartbeatTimer?.cancel();
-    _servoCommandTimer?.cancel(); // Cancel servo command timer
+    _servoCommandTimer?.cancel();
+    _connectionTimeoutTimer?.cancel();
     
     // Close WebSocket
     if (_channel != null) {
       try {
-        await _channel!.sink.close(1000, 'Normal closure');
+        await _channel!.sink.close(status.normalClosure, 'Normal closure');
       } catch (e) {
         _logMessage('Error during disconnect: $e');
       }
@@ -509,6 +570,22 @@ class DroneController {
   void resetConnection() {
     _retries = 0;
     _consecutiveFailures = 0;
+    connect();
+  }
+
+  // Add method to check connection health
+  bool isConnectionHealthy() {
+    if (!isConnected) return false;
+    
+    final timeSinceLastMessage = DateTime.now().difference(_lastMessageTime);
+    return timeSinceLastMessage < connectionTimeoutThreshold;
+  }
+
+  // Add method to force reconnect
+  void forceReconnect() {
+    _logMessage('Forcing reconnection...');
+    _consecutiveFailures = 0;
+    _retries = 0;
     connect();
   }
 
