@@ -10,11 +10,9 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // 系統狀態列/導覽列樣式（與首頁深色系一致）
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-    statusBarColor: Color(0xFFBFC2DF),
-    statusBarIconBrightness: Brightness.light, // Android 狀態列圖示顏色
+    statusBarColor: Color(0xFFFCFCFD),
+    statusBarIconBrightness: Brightness.dark, // Android 狀態列圖示顏色
     statusBarBrightness: Brightness.dark, // iOS 狀態列內容顏色
-    systemNavigationBarColor: Color(0xBFC2DFFF),
-    systemNavigationBarIconBrightness: Brightness.light,
   ));
   // 日誌設定
   Logger.root.level = Level.ALL;
@@ -58,12 +56,14 @@ class _HomeState extends State<Home> {
         decoration: BoxDecoration(
           gradient: LinearGradient(
             colors: [
-              Color(0xFF2E335A).withOpacity(0.4), // 深藍紫
-              Color(0xFF1C1B33).withOpacity(0.9), // 更深藍
+              Colors.white,           // 白色
+              Colors.grey[400]!,      // 浅灰
+              Colors.grey[700]!,      // 深灰
+              Colors.black,           // 黑色
             ],
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            stops: [0.2, 1.0],
+            stops: [0.0, 0.33, 0.66, 1.0],
           ),
         ),
         child: Padding(

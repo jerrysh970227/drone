@@ -88,7 +88,7 @@ class VideoRecordingService extends ChangeNotifier {
 
   Future<bool> _testConnection() async {
     try {
-      final url = Uri.parse('http://$_serverIP:8770/health');
+      final url = Uri.parse('ws://$_serverIP:8770/health');
       debugPrint('測試媒體服務器連接: $url');
       
       // 添加重试机制
@@ -147,7 +147,7 @@ class VideoRecordingService extends ChangeNotifier {
 
   Future<void> _updateStatus() async {
     try {
-      final url = Uri.parse('http://$_serverIP:8770/video/status');
+      final url = Uri.parse('ws://$_serverIP:8770/video/status');
       debugPrint('請求錄影狀態: $url');
       
       // 添加重试机制
@@ -297,7 +297,7 @@ class VideoRecordingService extends ChangeNotifier {
     _clearError();
 
     try {
-      final uri = Uri.parse('http://$_serverIP:8770/video/start');
+      final uri = Uri.parse('ws://$_serverIP:8770/video/start');
       final queryParams = <String, String>{};
       
       if (filename != null) queryParams['filename'] = filename;
@@ -359,7 +359,7 @@ class VideoRecordingService extends ChangeNotifier {
     }
 
     try {
-      final uri = Uri.parse('http://$_serverIP:8770/video/stop');
+      final uri = Uri.parse('ws://$_serverIP:8770/video/stop');
       debugPrint('發送停止錄影請求到: $uri');
       
       // Increase timeout for recording stop request
@@ -422,7 +422,7 @@ class VideoRecordingService extends ChangeNotifier {
     }
 
     try {
-      final uri = Uri.parse('http://$_serverIP:8770/photo');
+      final uri = Uri.parse('ws://$_serverIP:8770/photo');
       final queryParams = <String, String>{};
       
       if (filename != null) queryParams['filename'] = filename;
@@ -470,7 +470,7 @@ class VideoRecordingService extends ChangeNotifier {
 
   Future<bool> downloadRecording(String filename, String localPath) async {
     try {
-      final url = Uri.parse('http://$_serverIP:8770/media/$filename');
+      final url = Uri.parse('ws://$_serverIP:8770/media/$filename');
       final response = await http.get(url).timeout(const Duration(seconds: 60));
       debugPrint('下載回應: ${response.statusCode}');
 

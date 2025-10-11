@@ -91,50 +91,53 @@ class _RecordButtonState extends State<RecordButton>
       children: [
         // 錄影時間顯示（只在錄影時顯示）
         if (isRecording)
-          Container(
-            margin: const EdgeInsets.only(bottom: 8),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: Colors.red.withOpacity(0.9),
-              borderRadius: BorderRadius.circular(20),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.red.withOpacity(0.3),
-                  blurRadius: 8,
-                  offset: const Offset(0, 2),
-                ),
-              ],
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // 閃爍的錄影圓點
-                AnimatedBuilder(
-                  animation: _controller,
-                  builder: (context, child) {
-                    return Container(
-                      width: 8,
-                      height: 8,
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(
-                            0.3 + (0.7 * (1 - _pulseAnimIcon.value))
+          Positioned(
+            top: (MediaQuery.of(context).size.height - 50) / 2,
+            child: Container(
+              // margin: const EdgeInsets.only(bottom: 8),
+              // padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.red.withOpacity(0.6),
+                borderRadius: BorderRadius.circular(20),
+                // boxShadow: [
+                //   BoxShadow(
+                //     color: Colors.red.withOpacity(0.3),
+                //     blurRadius: 8,
+                //     offset: const Offset(0, 2),
+                //   ),
+                // ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // 閃爍的錄影圓點
+                  AnimatedBuilder(
+                    animation: _controller,
+                    builder: (context, child) {
+                      return Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(
+                              0.3 + (0.7 * (1 - _pulseAnimIcon.value))
+                          ),
+                          shape: BoxShape.circle,
                         ),
-                        shape: BoxShape.circle,
-                      ),
-                    );
-                  },
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  widget.service.formattedTime,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 14,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.2,
+                      );
+                    },
                   ),
-                ),
-              ],
+                  const SizedBox(width: 6),
+                  Text(
+                    widget.service.formattedTime,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         // 錄影按鈕本體

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:io';
+import 'dart:ui';
 import 'package:drone/model/RecordService.dart';
 import 'package:drone/ui/RecordButton.dart';
 import 'package:http/http.dart' as http;
@@ -795,100 +796,109 @@ void _onRecordingStateChanged(){
 
   Widget _buildTopStatusBar() {
     return Positioned(
-      top: 0,
-      left: 16,
+      top: 5,
+      left: 5,
       right: 16,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-        child: Row(
-          children: [
-            IconButton(
-              onPressed: () async {
-                await SystemChrome.setPreferredOrientations([
-                  DeviceOrientation.portraitUp,
-                ]);
-                if (mounted) {
-                  Navigator.pushAndRemoveUntil(
-                    context,
-                    MaterialPageRoute(builder: (context) => const Home()),
-                    (route) => false,
-                  );
-                  log.info('已跳轉到 Home 頁面');
-                }
-              },
-              style: IconButton.styleFrom(
-                backgroundColor: Colors.white.withOpacity(0.15),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
+      child: ClipRRect(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 5,sigmaY: 5),
+          child: Container(
+            decoration: BoxDecoration(
+              shape: BoxShape.rectangle,
+                border: Border.all(color : Colors.white24),
+            borderRadius: BorderRadius.circular(20)),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+            child: Row(
+              children: [
+                IconButton(
+                  onPressed: () async {
+                    await SystemChrome.setPreferredOrientations([
+                      DeviceOrientation.portraitUp,
+                    ]);
+                    if (mounted) {
+                      Navigator.pushAndRemoveUntil(
+                        context,
+                        MaterialPageRoute(builder: (context) => const Home()),
+                        (route) => false,
+                      );
+                      log.info('已跳轉到 Home 頁面');
+                    }
+                  },
+                  style: IconButton.styleFrom(
+                    backgroundColor: Colors.white.withOpacity(0.15),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    padding: const EdgeInsets.all(10),
+                  ),
+                  icon: const Icon(
+                    Icons.arrow_back_ios_new,
+                    color: Colors.white,
+                    size: 20,
+                  ),
                 ),
-                padding: const EdgeInsets.all(10),
-              ),
-              icon: const Icon(
-                Icons.arrow_back_ios_new,
-                color: Colors.white,
-                size: 20,
-              ),
-            ),
-            const SizedBox(width: 10),
-            // WebSocket連線
-            _buildConnectionButton(
-              icon:
-                  isWebSocketConnected
-                      ? Icons.wifi_rounded
-                      : Icons.wifi_off_rounded,
-              isConnected: isWebSocketConnected,
-              onPressed: () {
-                if (isWebSocketConnected) {
-                  _controller.disconnect();
-                  setState(() {
-                    isWebSocketConnected = false;
-                  });
-                } else {
-                  _controller.connect();
-                  // 狀態會在 controller 的回調中自動更新
-                }
-              },
-              tooltip: 'WebSocket連線',
-            ),
-            // 視訊串流
-            const SizedBox(width: 8),
-            _buildConnectionButton(
-              icon:
-                  isCameraConnected
-                      ? Icons.videocam_rounded
-                      : Icons.videocam_off_rounded,
-              isConnected: isCameraConnected,
-              onPressed: () {
-                if (isCameraConnected) {
-                  disconnect();
-                  setState(() {
-                    isCameraConnected = false;
-                  });
-                } else {
-                  reconnect();
-                }
-              },
-              tooltip: '視訊串流',
-            ),
-            const SizedBox(width: 8),
-            const Spacer(),
-            Text(
-              '伺服: ${_servoAngle?.toStringAsFixed(1) ?? 0.0}°',
-              style: const TextStyle(color: Colors.white, fontSize: 12),
-            ),
-            const SizedBox(width: 8),
-            IconButton(
-              onPressed: _showMenuDialog,
-              style: IconButton.styleFrom(
-                backgroundColor: Colors.white.withOpacity(0.15),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
+                const SizedBox(width: 10),
+                // WebSocket連線
+                _buildConnectionButton(
+                  icon:
+                      isWebSocketConnected
+                          ? Icons.wifi_rounded
+                          : Icons.wifi_off_rounded,
+                  isConnected: isWebSocketConnected,
+                  onPressed: () {
+                    if (isWebSocketConnected) {
+                      _controller.disconnect();
+                      setState(() {
+                        isWebSocketConnected = false;
+                      });
+                    } else {
+                      _controller.connect();
+                      // 狀態會在 controller 的回調中自動更新
+                    }
+                  },
+                  tooltip: 'WebSocket連線',
                 ),
-                padding: const EdgeInsets.all(10),
-              ),
-              icon: const Icon(Icons.menu, color: Colors.white, size: 20),
+                // 視訊串流
+                const SizedBox(width: 8),
+                _buildConnectionButton(
+                  icon:
+                      isCameraConnected
+                          ? Icons.videocam_rounded
+                          : Icons.videocam_off_rounded,
+                  isConnected: isCameraConnected,
+                  onPressed: () {
+                    if (isCameraConnected) {
+                      disconnect();
+                      setState(() {
+                        isCameraConnected = false;
+                      });
+                    } else {
+                      reconnect();
+                    }
+                  },
+                  tooltip: '視訊串流',
+                ),
+                const SizedBox(width: 8),
+                const Spacer(),
+                Text(
+                  '伺服: ${_servoAngle?.toStringAsFixed(1) ?? 0.0}°',
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  onPressed: _showMenuDialog,
+                  style: IconButton.styleFrom(
+                    backgroundColor: Colors.white.withOpacity(0.15),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    padding: const EdgeInsets.all(10),
+                  ),
+                  icon: const Icon(Icons.menu, color: Colors.white, size: 20),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );
@@ -1560,7 +1570,7 @@ void _onRecordingStateChanged(){
             if (_shouldShowControls()) _buildBottomControlArea(),
             Positioned(
               left: 20,
-              bottom: MediaQuery.of(context).size.height * 0.55,
+              bottom: MediaQuery.of(context).size.height * 0.50,
               child: Container(
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(20),
